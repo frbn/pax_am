@@ -1,0 +1,5 @@
+# pax extension
+comment = 'Table AM for Partition Attributes Across data organization model'
+default_version = '1.0'
+module_pathname = '$libdir/pax_am'
+relocatable = true
