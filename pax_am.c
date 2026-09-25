@@ -16,9 +16,8 @@
  *
  * Limitations :
  *   - pas de FSM réel (recherche first-fit linéaire sur les pages)
- *   - MVCC d'insertion implémenté, mais pas de versions UPDATE / DELETE
+ *   - versions UPDATE / DELETE append-only, sans VACUUM ni gel des tuples
  *   - pas de Generic WAL (perte potentielle en cas de crash)
- *   - pas de vacuum, ni de gel des tuples
  *   - pas d'index, de parallélisme ou d'opérations DDL non réécrivantes
  *
  */
@@ -60,13 +59,14 @@
 /* extension */
 PG_MODULE_MAGIC;
 
-#define PAX_PAGE_VERSION            2
+#define PAX_PAGE_VERSION            3
 #define PAX_SPECIAL_MAGIC           0x5041 /* "PA" */
 
 #define PAX_FLAG_HAS_NULLS          0x0001
 #define PAX_FLAG_HAS_VARLENA        0x0002
 #define PAX_FLAG_COMPRESSED         0x0004
 #define PAX_FLAG_HAS_XMIN_XMAX      0x0008
+#define PAX_FLAG_HAS_VERSIONS       0x0010
 
 /* bits8 abandonned in v19*/
 #if PG_VERSION_NUM >= 190000
@@ -103,12 +103,20 @@ typedef struct PaxTupleMetaData
     TransactionId xmax;
     CommandId     cmin;
     CommandId     cmax;
+    ItemPointerData t_ctid;     /* physical successor, or self for a leaf */
+    uint16        flags;       /* reserved; must be zero in page version 3 */
+    MultiXactId   locker_mxid; /* lock-only members; never an updater */
+    uint32        reserved2;   /* explicit tail padding; must be zero */
 } PaxTupleMetaData;
 
 #define SizeOfPaxTupleMetaData   MAXALIGN(sizeof(PaxTupleMetaData))
 
 StaticAssertDecl(sizeof(PaxTupleMetaData) == SizeOfPaxTupleMetaData,
                  "PAX tuple metadata must have a fixed on-disk size");
+StaticAssertDecl(SizeOfPaxTupleMetaData == 32,
+                 "PAX version-3 tuple metadata must be exactly 32 bytes");
+StaticAssertDecl(offsetof(PaxTupleMetaData, t_ctid) == 16,
+                 "PAX tuple metadata transaction fields must occupy 16 bytes");
 
 typedef struct PaxPageHeader
 {
@@ -196,11 +204,11 @@ typedef struct PaxScanDescData
 {
     TableScanDescData rs_base;      /* DOIT être le premier champ */
 
-    Buffer          current_buf;
-    PaxPageDesc    *current_pdesc;
-    int             current_tupno;
+    int             current_tupno;   /* last returned tuple index on block */
     BlockNumber     current_block;
     BlockNumber     nblocks;
+    ItemPointerData tidrange_max;
+    bool            tidrange_done;
 } PaxScanDescData;
 
 typedef PaxScanDescData *PaxScanDesc;
@@ -231,8 +239,11 @@ static Size         pax_meta_region_size(Page page, PaxPageHeader *phdr);
 static void         pax_insert_bytes(Page page, PaxPageHeader *phdr,
                                      int n_attrs, int region_idx,
                                      Size at, Size len);
+static bool         pax_meta_xmin_visible(const PaxTupleMetaData *meta,
+                                          Snapshot snapshot);
 static bool         pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta,
                                                 Snapshot snapshot);
+static TransactionId pax_locker_xmax(const PaxTupleMetaData *meta);
 static int          pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc,
                                            int start);
 static void         pax_store_tuple_slot(Relation rel, TupleTableSlot *slot,
@@ -266,6 +277,12 @@ static void         pax_scan_rescan(TableScanDesc sscan, ScanKey key,
 static bool         pax_scan_getnextslot(TableScanDesc sscan,
                                          ScanDirection direction,
                                          TupleTableSlot *slot);
+static void         pax_scan_set_tidrange(TableScanDesc sscan,
+                                           ItemPointer mintid,
+                                           ItemPointer maxtid);
+static bool         pax_scan_getnextslot_tidrange(TableScanDesc sscan,
+                                                  ScanDirection direction,
+                                                  TupleTableSlot *slot);
 
 /* Tuple lookup / visibility */
 static bool         pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
@@ -291,6 +308,96 @@ static void         pax_tuple_insert(Relation rel, TupleTableSlot *slot,
                                      BulkInsertState bistate);
 #endif
 
+/* Versioned UPDATE / DELETE / row locking */
+static TM_Result    pax_tuple_delete(Relation rel, ItemPointer tid,
+                                     CommandId cid, uint32 options,
+                                     Snapshot snapshot, Snapshot crosscheck,
+                                     bool wait, TM_FailureData *tmfd);
+static TM_Result    pax_tuple_update(Relation rel, ItemPointer otid,
+                                     TupleTableSlot *slot, CommandId cid,
+                                     uint32 options, Snapshot snapshot,
+                                     Snapshot crosscheck, bool wait,
+                                     TM_FailureData *tmfd,
+                                     LockTupleMode *lockmode,
+                                     TU_UpdateIndexes *update_indexes);
+static TM_Result    pax_tuple_lock(Relation rel, ItemPointer tid,
+                                   Snapshot snapshot, TupleTableSlot *slot,
+                                   CommandId cid, LockTupleMode mode,
+                                   LockWaitPolicy wait_policy, uint8 flags,
+                                   TM_FailureData *tmfd);
+
+/* Required PG19 callbacks that are not implemented yet. */
+static void         pax_report_unsupported(const char *feature);
+static Size         pax_parallelscan_estimate(Relation rel);
+static Size         pax_parallelscan_initialize(Relation rel,
+                                                ParallelTableScanDesc pscan);
+static void         pax_parallelscan_reinitialize(Relation rel,
+                                                   ParallelTableScanDesc pscan);
+static struct IndexFetchTableData *pax_index_fetch_begin(Relation rel,
+                                                          uint32 flags);
+static void         pax_index_fetch_reset(struct IndexFetchTableData *data);
+static void         pax_index_fetch_end(struct IndexFetchTableData *data);
+static bool         pax_index_fetch_tuple(struct IndexFetchTableData *scan,
+                                          ItemPointer tid, Snapshot snapshot,
+                                          TupleTableSlot *slot,
+                                          bool *call_again, bool *all_dead);
+static TransactionId pax_index_delete_tuples(Relation rel,
+                                             TM_IndexDeleteOp *delstate);
+static void         pax_tuple_insert_speculative(Relation rel,
+                                                 TupleTableSlot *slot,
+                                                 CommandId cid, uint32 options,
+                                                 BulkInsertState bistate,
+                                                 uint32 specToken);
+static void         pax_tuple_complete_speculative(Relation rel,
+                                                   TupleTableSlot *slot,
+                                                   uint32 specToken,
+                                                   bool succeeded);
+static void         pax_multi_insert(Relation rel, TupleTableSlot **slots,
+                                     int nslots, CommandId cid, uint32 options,
+                                     BulkInsertState bistate);
+static void         pax_relation_copy_data(Relation rel,
+                                            const RelFileLocator *newrlocator);
+static void         pax_relation_copy_for_cluster(Relation oldtable,
+                                                  Relation newtable,
+                                                  Relation oldindex,
+                                                  bool use_sort,
+                                                  TransactionId oldestxmin,
+                                                  TransactionId *xid_cutoff,
+                                                  MultiXactId *multi_cutoff,
+                                                  double *num_tuples,
+                                                  double *tups_vacuumed,
+                                                  double *tups_recently_dead);
+static void         pax_relation_vacuum(Relation rel,
+                                         const VacuumParams *params,
+                                         BufferAccessStrategy bstrategy);
+static bool         pax_scan_analyze_next_block(TableScanDesc scan,
+                                                ReadStream *stream);
+static bool         pax_scan_analyze_next_tuple(TableScanDesc scan,
+                                                double *liverows,
+                                                double *deadrows,
+                                                TupleTableSlot *slot);
+static double        pax_index_build_range_scan(Relation table_rel,
+                                                 Relation index_rel,
+                                                 IndexInfo *index_info,
+                                                 bool allow_sync,
+                                                 bool anyvisible,
+                                                 bool progress,
+                                                 BlockNumber start_blockno,
+                                                 BlockNumber numblocks,
+                                                 IndexBuildCallback callback,
+                                                 void *callback_state,
+                                                 TableScanDesc scan);
+static void         pax_index_validate_scan(Relation table_rel,
+                                            Relation index_rel,
+                                            IndexInfo *index_info,
+                                            Snapshot snapshot,
+                                            ValidateIndexState *state);
+static bool         pax_scan_sample_next_block(TableScanDesc scan,
+                                               SampleScanState *scanstate);
+static bool         pax_scan_sample_next_tuple(TableScanDesc scan,
+                                               SampleScanState *scanstate,
+                                               TupleTableSlot *slot);
+
 /* DDL / planner (pour CREATE TABLE) */
 static void         pax_relation_set_new_filelocator(Relation rel,
                                                      const RelFileLocator *newrlocator,
@@ -308,6 +415,173 @@ static void         pax_relation_estimate_size(Relation rel, int32 *attr_widths,
 Datum               pax_tableam_handler(PG_FUNCTION_ARGS);
 
 /* ------------------------------------------------------------------ */
+/* Required callbacks not implemented by this prototype               */
+/* ------------------------------------------------------------------ */
+
+static void
+pax_report_unsupported(const char *feature)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("pax table AM does not support %s", feature)));
+}
+
+static Size
+pax_parallelscan_estimate(Relation rel)
+{
+    pax_report_unsupported("parallel table scans");
+    return 0;
+}
+
+static Size
+pax_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
+{
+    pax_report_unsupported("parallel table scans");
+    return 0;
+}
+
+static void
+pax_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
+{
+    pax_report_unsupported("parallel table scans");
+}
+
+static struct IndexFetchTableData *
+pax_index_fetch_begin(Relation rel, uint32 flags)
+{
+    pax_report_unsupported("index scans");
+    return NULL;
+}
+
+static void
+pax_index_fetch_reset(struct IndexFetchTableData *data)
+{
+    pax_report_unsupported("index scans");
+}
+
+static void
+pax_index_fetch_end(struct IndexFetchTableData *data)
+{
+    pax_report_unsupported("index scans");
+}
+
+static bool
+pax_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
+                      Snapshot snapshot, TupleTableSlot *slot,
+                      bool *call_again, bool *all_dead)
+{
+    pax_report_unsupported("index scans");
+    return false;
+}
+
+static TransactionId
+pax_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
+{
+    pax_report_unsupported("index tuple deletion");
+    return InvalidTransactionId;
+}
+
+static void
+pax_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
+                             CommandId cid, uint32 options,
+                             BulkInsertState bistate, uint32 specToken)
+{
+    pax_report_unsupported("speculative insertion");
+}
+
+static void
+pax_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
+                               uint32 specToken, bool succeeded)
+{
+    pax_report_unsupported("speculative insertion");
+}
+
+static void
+pax_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
+                 CommandId cid, uint32 options, BulkInsertState bistate)
+{
+    int i;
+
+    for (i = 0; i < nslots; i++)
+        pax_tuple_insert(rel, slots[i], cid, options, bistate);
+}
+
+static void
+pax_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
+{
+    pax_report_unsupported("physical relation copying");
+}
+
+static void
+pax_relation_copy_for_cluster(Relation oldtable, Relation newtable,
+                              Relation oldindex, bool use_sort,
+                              TransactionId oldestxmin,
+                              TransactionId *xid_cutoff,
+                              MultiXactId *multi_cutoff,
+                              double *num_tuples, double *tups_vacuumed,
+                              double *tups_recently_dead)
+{
+    pax_report_unsupported("CLUSTER");
+}
+
+static void
+pax_relation_vacuum(Relation rel, const VacuumParams *params,
+                     BufferAccessStrategy bstrategy)
+{
+    pax_report_unsupported("VACUUM");
+}
+
+static bool
+pax_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
+{
+    pax_report_unsupported("ANALYZE table scans");
+    return false;
+}
+
+static bool
+pax_scan_analyze_next_tuple(TableScanDesc scan, double *liverows,
+                            double *deadrows, TupleTableSlot *slot)
+{
+    pax_report_unsupported("ANALYZE table scans");
+    return false;
+}
+
+static double
+pax_index_build_range_scan(Relation table_rel, Relation index_rel,
+                           IndexInfo *index_info, bool allow_sync,
+                           bool anyvisible, bool progress,
+                           BlockNumber start_blockno, BlockNumber numblocks,
+                           IndexBuildCallback callback, void *callback_state,
+                           TableScanDesc scan)
+{
+    pax_report_unsupported("index builds");
+    return 0;
+}
+
+static void
+pax_index_validate_scan(Relation table_rel, Relation index_rel,
+                        IndexInfo *index_info, Snapshot snapshot,
+                        ValidateIndexState *state)
+{
+    pax_report_unsupported("index validation");
+}
+
+static bool
+pax_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
+{
+    pax_report_unsupported("TABLESAMPLE");
+    return false;
+}
+
+static bool
+pax_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
+                           TupleTableSlot *slot)
+{
+    pax_report_unsupported("TABLESAMPLE");
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
 /* TableAmRoutine                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -322,28 +596,102 @@ static const TableAmRoutine pax_methods = {
     .scan_end       = pax_scan_end,
     .scan_rescan    = pax_scan_rescan,
     .scan_getnextslot = pax_scan_getnextslot,
+    .scan_set_tidrange = pax_scan_set_tidrange,
+    .scan_getnextslot_tidrange = pax_scan_getnextslot_tidrange,
+
+    /* Parallel scans are rejected with an explicit error. */
+    .parallelscan_estimate = pax_parallelscan_estimate,
+    .parallelscan_initialize = pax_parallelscan_initialize,
+    .parallelscan_reinitialize = pax_parallelscan_reinitialize,
+
+    /* Index fetch is unsupported. */
+    .index_fetch_begin = pax_index_fetch_begin,
+    .index_fetch_reset = pax_index_fetch_reset,
+    .index_fetch_end = pax_index_fetch_end,
+    .index_fetch_tuple = pax_index_fetch_tuple,
 
     /* Tuple lookup / MVCC visibility */
     .tuple_fetch_row_version = pax_tuple_fetch_row_version,
     .tuple_tid_valid = pax_tuple_tid_valid,
     .tuple_get_latest_tid = pax_tuple_get_latest_tid,
     .tuple_satisfies_snapshot = pax_tuple_satisfies_snapshot,
+    .index_delete_tuples = pax_index_delete_tuples,
 
-    /* Insert (minimal) */
+    /* Insert and versioned DML */
     .tuple_insert   = pax_tuple_insert,
+    .tuple_insert_speculative = pax_tuple_insert_speculative,
+    .tuple_complete_speculative = pax_tuple_complete_speculative,
+    .multi_insert   = pax_multi_insert,
+    .tuple_delete   = pax_tuple_delete,
+    .tuple_update   = pax_tuple_update,
+    .tuple_lock     = pax_tuple_lock,
 
     /* DDL / stockage — (pour CREATE TABLE / TRUNCATE / planner) */
     .relation_set_new_filelocator = pax_relation_set_new_filelocator,
     .relation_nontransactional_truncate = pax_relation_nontransactional_truncate,
+    .relation_copy_data = pax_relation_copy_data,
+    .relation_copy_for_cluster = pax_relation_copy_for_cluster,
+    .relation_vacuum = pax_relation_vacuum,
+
+    /* ANALYZE and index-build scans are rejected explicitly. */
+    .scan_analyze_next_block = pax_scan_analyze_next_block,
+    .scan_analyze_next_tuple = pax_scan_analyze_next_tuple,
+    .index_build_range_scan = pax_index_build_range_scan,
+    .index_validate_scan = pax_index_validate_scan,
+
     .relation_size  = pax_relation_size,
     .relation_needs_toast_table = pax_relation_needs_toast_table,
     .relation_estimate_size = pax_relation_estimate_size,
 
-    /*
-     * Tous les autres callbacks restent NULL pour l'instant.
-     * PostgreSQL plantera s'ils sont appelés
-     */
+    /* TABLESAMPLE is unsupported. */
+    .scan_sample_next_block = pax_scan_sample_next_block,
+    .scan_sample_next_tuple = pax_scan_sample_next_tuple,
+
+    /* Optional callbacks remain NULL; all PG19-required slots are wired. */
 };
+
+static void
+pax_validate_table_am_routine(void)
+{
+    if (pax_methods.scan_begin == NULL ||
+        pax_methods.scan_end == NULL ||
+        pax_methods.scan_rescan == NULL ||
+        pax_methods.scan_getnextslot == NULL ||
+        pax_methods.parallelscan_estimate == NULL ||
+        pax_methods.parallelscan_initialize == NULL ||
+        pax_methods.parallelscan_reinitialize == NULL ||
+        pax_methods.index_fetch_begin == NULL ||
+        pax_methods.index_fetch_reset == NULL ||
+        pax_methods.index_fetch_end == NULL ||
+        pax_methods.index_fetch_tuple == NULL ||
+        pax_methods.tuple_fetch_row_version == NULL ||
+        pax_methods.tuple_tid_valid == NULL ||
+        pax_methods.tuple_get_latest_tid == NULL ||
+        pax_methods.tuple_satisfies_snapshot == NULL ||
+        pax_methods.index_delete_tuples == NULL ||
+        pax_methods.tuple_insert == NULL ||
+        pax_methods.tuple_insert_speculative == NULL ||
+        pax_methods.tuple_complete_speculative == NULL ||
+        pax_methods.multi_insert == NULL ||
+        pax_methods.tuple_delete == NULL ||
+        pax_methods.tuple_update == NULL ||
+        pax_methods.tuple_lock == NULL ||
+        pax_methods.relation_set_new_filelocator == NULL ||
+        pax_methods.relation_nontransactional_truncate == NULL ||
+        pax_methods.relation_copy_data == NULL ||
+        pax_methods.relation_copy_for_cluster == NULL ||
+        pax_methods.relation_vacuum == NULL ||
+        pax_methods.scan_analyze_next_block == NULL ||
+        pax_methods.scan_analyze_next_tuple == NULL ||
+        pax_methods.index_build_range_scan == NULL ||
+        pax_methods.index_validate_scan == NULL ||
+        pax_methods.relation_size == NULL ||
+        pax_methods.relation_needs_toast_table == NULL ||
+        pax_methods.relation_estimate_size == NULL ||
+        pax_methods.scan_sample_next_block == NULL ||
+        pax_methods.scan_sample_next_tuple == NULL)
+        elog(ERROR, "pax: incomplete PG19 table AM routine");
+}
 
 /* ------------------------------------------------------------------ */
 /* Page management                                                     */
@@ -363,7 +711,7 @@ pax_page_init(Page page, int n_attrs)
 
     special = (PaxSpecialData *) PageGetSpecialPointer(page);
     special->version  = PAX_PAGE_VERSION;
-    special->flags    = PAX_FLAG_HAS_XMIN_XMAX;
+    special->flags    = PAX_FLAG_HAS_XMIN_XMAX | PAX_FLAG_HAS_VERSIONS;
     special->n_attrs  = (uint16) n_attrs;
     special->magic = PAX_SPECIAL_MAGIC;
 
@@ -374,7 +722,7 @@ pax_page_init(Page page, int n_attrs)
 
     phdr->n_tuples   = 0;
     phdr->free_space = (uint16) (BLCKSZ - (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size));
-    phdr->flags      = PAX_FLAG_HAS_XMIN_XMAX;
+    phdr->flags      = PAX_FLAG_HAS_XMIN_XMAX | PAX_FLAG_HAS_VERSIONS;
 
     for (i = 0; i < n_attrs; i++)
         phdr->offsets[i] = InvalidOffsetNumber;
@@ -395,7 +743,8 @@ pax_page_is_valid(Page page)
     special = (PaxSpecialData *) PageGetSpecialPointer(page);
     return (special->version == PAX_PAGE_VERSION &&
             special->magic == PAX_SPECIAL_MAGIC &&
-            (special->flags & PAX_FLAG_HAS_XMIN_XMAX) != 0);
+            (special->flags & PAX_FLAG_HAS_XMIN_XMAX) != 0 &&
+            (special->flags & PAX_FLAG_HAS_VERSIONS) != 0);
 }
 
 /*
@@ -423,8 +772,9 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
         elog(ERROR, "pax: attribute count mismatch (page %u vs tupdesc %d)",
              special->n_attrs, tupdesc->natts);
 
-    if ((special->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0)
-        elog(ERROR, "pax: page does not contain transaction metadata");
+    if ((special->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0 ||
+        (special->flags & PAX_FLAG_HAS_VERSIONS) == 0)
+        elog(ERROR, "pax: page lacks required transaction/version metadata");
 
     phdr = PaxPageHeaderPtr(page);
 
@@ -436,8 +786,9 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
     desc->n_tuples = phdr->n_tuples;
     desc->ctx      = CurrentMemoryContext;
 
-    if ((phdr->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0)
-        elog(ERROR, "pax: page header does not contain transaction metadata");
+    if ((phdr->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0 ||
+        (phdr->flags & PAX_FLAG_HAS_VERSIONS) == 0)
+        elog(ERROR, "pax: page header lacks required transaction/version metadata");
 
     if (desc->n_tuples > 0)
     {
@@ -473,6 +824,15 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
             if (TransactionIdIsValid(meta->xmax) &&
                 meta->cmax == InvalidCommandId)
                 elog(ERROR, "pax: tuple %d has xmax without cmax", i);
+            if (!ItemPointerIsValid(&meta->t_ctid) ||
+                !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
+                elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
+            if (meta->flags != 0)
+                elog(ERROR, "pax: tuple %d has unknown metadata flags %#x",
+                     i, meta->flags);
+            if (meta->reserved2 != 0)
+                elog(ERROR, "pax: tuple %d has nonzero metadata padding",
+                     i);
         }
     }
 
@@ -812,7 +1172,7 @@ pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
 }
 
 static bool
-pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
+pax_meta_xmin_visible(const PaxTupleMetaData *meta, Snapshot snapshot)
 {
     bool self_snapshot;
 
@@ -834,35 +1194,37 @@ pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
 
     if (meta->xmin == FrozenTransactionId ||
         meta->xmin == BootstrapTransactionId)
-    {
-        /* frozen/bootstrap inserting transaction is visible */
-    }
-    else if (TransactionIdIsCurrentTransactionId(meta->xmin))
-    {
-        if (!self_snapshot && meta->cmin >= snapshot->curcid)
-            return false;       /* inserted by the current command */
-    }
-    else if (self_snapshot)
-    {
-        if (TransactionIdIsInProgress(meta->xmin) ||
-            !TransactionIdDidCommit(meta->xmin))
-            return false;
-    }
-    else
-    {
-        if (XidInMVCCSnapshot(meta->xmin, snapshot))
-            return false;       /* inserter still in progress */
-        if (!TransactionIdDidCommit(meta->xmin))
-            return false;       /* inserter aborted */
-    }
+        return true;
+
+    if (TransactionIdIsCurrentTransactionId(meta->xmin))
+        return self_snapshot || meta->cmin < snapshot->curcid;
+
+    if (self_snapshot)
+        return !TransactionIdIsInProgress(meta->xmin) &&
+            TransactionIdDidCommit(meta->xmin);
+
+    if (XidInMVCCSnapshot(meta->xmin, snapshot))
+        return false;
+    return TransactionIdDidCommit(meta->xmin);
+}
+
+static bool
+pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
+{
+    if (!pax_meta_xmin_visible(meta, snapshot))
+        return false;
+
+    if (snapshot->snapshot_type == SNAPSHOT_ANY)
+        return true;
 
     if (!TransactionIdIsValid(meta->xmax))
         return true;
 
     if (TransactionIdIsCurrentTransactionId(meta->xmax))
-        return self_snapshot ? false : meta->cmax >= snapshot->curcid;
+        return snapshot->snapshot_type == SNAPSHOT_SELF ?
+            false : meta->cmax >= snapshot->curcid;
 
-    if (self_snapshot)
+    if (snapshot->snapshot_type == SNAPSHOT_SELF)
     {
         if (TransactionIdIsInProgress(meta->xmax) ||
             !TransactionIdDidCommit(meta->xmax))
@@ -871,11 +1233,11 @@ pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
     }
 
     if (XidInMVCCSnapshot(meta->xmax, snapshot))
-        return true;            /* deleter still in progress */
+        return true;
     if (!TransactionIdDidCommit(meta->xmax))
-        return true;            /* deleter aborted */
+        return true;
 
-    return false;               /* deleter committed */
+    return false;
 }
 
 static int
@@ -1006,12 +1368,14 @@ pax_slot_getsysattr(TupleTableSlot *base, int attnum, bool *isnull)
         case MinCommandIdAttributeNumber:
             return CommandIdGetDatum(slot->tuple_meta.cmin);
         case MaxTransactionIdAttributeNumber:
-            return TransactionIdGetDatum(slot->tuple_meta.xmax);
+            return TransactionIdGetDatum(pax_locker_xmax(&slot->tuple_meta));
         case MaxCommandIdAttributeNumber:
-            /* Heap exposes the raw shared command field when xmax is absent. */
-            return CommandIdGetDatum(TransactionIdIsValid(slot->tuple_meta.xmax) ?
-                                     slot->tuple_meta.cmax :
-                                     slot->tuple_meta.cmin);
+            /* Heap exposes the shared command field when no update is active. */
+            return CommandIdGetDatum(
+                TransactionIdIsValid(slot->tuple_meta.xmax) &&
+                (TransactionIdIsCurrentTransactionId(slot->tuple_meta.xmax) ||
+                 TransactionIdIsInProgress(slot->tuple_meta.xmax)) ?
+                slot->tuple_meta.cmax : slot->tuple_meta.cmin);
         default:
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1215,6 +1579,17 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
 {
     PaxScanDesc scan;
 
+    (void) key;
+    if ((flags & SO_TYPE_SEQSCAN) == 0 &&
+        (flags & SO_TYPE_TIDSCAN) == 0 &&
+        (flags & SO_TYPE_TIDRANGESCAN) == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM supports only sequential and TID table scans")));
+    if (nkeys != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support scan keys")));
     if (pscan != NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1225,24 +1600,17 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
     scan = (PaxScanDesc) palloc0(sizeof(PaxScanDescData));
     scan->rs_base.rs_rd        = rel;
     scan->rs_base.rs_snapshot  = snapshot;
-    scan->rs_base.rs_nkeys     = nkeys;
+    scan->rs_base.rs_nkeys     = 0;
     scan->rs_base.rs_flags     = flags;
-    if (nkeys > 0 && key != NULL)
-    {
-        scan->rs_base.rs_key = palloc_array(ScanKeyData, nkeys);
-        memcpy(scan->rs_base.rs_key, key, sizeof(ScanKeyData) * nkeys);
-    }
-    else
-        scan->rs_base.rs_key = NULL;
+    scan->rs_base.rs_key       = NULL;
 
-    scan->current_buf    = InvalidBuffer;
-    scan->current_pdesc  = NULL;
     scan->current_tupno  = -1;
     scan->current_block  = 0;
     scan->nblocks        = RelationGetNumberOfBlocks(rel);
+    ItemPointerSetInvalid(&scan->tidrange_max);
+    scan->tidrange_done = false;
 
-    if (flags & SO_TYPE_SEQSCAN)
-        PredicateLockRelation(rel, snapshot);
+    PredicateLockRelation(rel, snapshot);
 
     return (TableScanDesc) scan;
 }
@@ -1251,18 +1619,6 @@ static void
 pax_scan_end(TableScanDesc sscan)
 {
     PaxScanDesc scan = (PaxScanDesc) sscan;
-
-    if (BufferIsValid(scan->current_buf))
-    {
-        ReleaseBuffer(scan->current_buf);
-        scan->current_buf = InvalidBuffer;
-    }
-
-    if (scan->current_pdesc)
-    {
-        pax_free_page_desc(scan->current_pdesc);
-        scan->current_pdesc = NULL;
-    }
 
     if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
         UnregisterSnapshot(scan->rs_base.rs_snapshot);
@@ -1278,33 +1634,12 @@ pax_scan_rescan(TableScanDesc sscan, ScanKey key,
 {
     PaxScanDesc scan = (PaxScanDesc) sscan;
 
-    if (BufferIsValid(scan->current_buf))
-    {
-        ReleaseBuffer(scan->current_buf);
-        scan->current_buf = InvalidBuffer;
-    }
-
-    if (scan->current_pdesc)
-    {
-        pax_free_page_desc(scan->current_pdesc);
-        scan->current_pdesc = NULL;
-    }
-
+    (void) key;
     scan->current_tupno = -1;
     scan->current_block = 0;
     scan->nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
-
-    if (scan->rs_base.rs_key)
-        pfree(scan->rs_base.rs_key);
-    if (key && scan->rs_base.rs_nkeys > 0)
-    {
-        scan->rs_base.rs_key = palloc_array(ScanKeyData,
-                                            scan->rs_base.rs_nkeys);
-        memcpy(scan->rs_base.rs_key, key,
-               sizeof(ScanKeyData) * scan->rs_base.rs_nkeys);
-    }
-    else
-        scan->rs_base.rs_key = NULL;
+    ItemPointerSetInvalid(&scan->tidrange_max);
+    scan->tidrange_done = false;
 }
 
 static bool
@@ -1314,35 +1649,25 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
     PaxScanDesc  scan = (PaxScanDesc) sscan;
     Relation     rel = scan->rs_base.rs_rd;
     TupleDesc    tupdesc = RelationGetDescr(rel);
-    Buffer       buf;
-    Page         page;
-    PaxPageDesc *pdesc;
-    int          tupno;
 
-    /* The previous slot may borrow scan->current_pdesc, so clear it first. */
+    if ((scan->rs_base.rs_flags & SO_TYPE_SEQSCAN) == 0)
+        elog(ERROR, "pax: non-sequential scan used sequential callback");
+
+    if (direction != ForwardScanDirection &&
+        direction != NoMovementScanDirection)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support backward scans")));
+
     ExecClearTuple(slot);
-
-    if (BufferIsValid(scan->current_buf))
-    {
-        pdesc = scan->current_pdesc;
-        tupno = pax_find_visible_tuple(scan, pdesc,
-                                       scan->current_tupno + 1);
-        if (tupno >= 0)
-        {
-            scan->current_tupno = tupno;
-            pax_store_tuple_slot(rel, slot, scan->current_buf, pdesc,
-                                 tupno, false);
-            return true;
-        }
-
-        ReleaseBuffer(scan->current_buf);
-        scan->current_buf = InvalidBuffer;
-        pax_free_page_desc(scan->current_pdesc);
-        scan->current_pdesc = NULL;
-    }
 
     while (scan->current_block < scan->nblocks)
     {
+        Buffer       buf;
+        Page         page;
+        PaxPageDesc *pdesc;
+        int          tupno;
+
         CHECK_FOR_INTERRUPTS();
 
         buf = ReadBuffer(rel, scan->current_block);
@@ -1357,28 +1682,149 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
         }
 
         pdesc = pax_build_page_desc(page, tupdesc);
-        tupno = pax_find_visible_tuple(scan, pdesc, 0);
-
-        /*
-         * The descriptor's transaction metadata is copied, but user values
-         * still borrow the page.  Keep the existing pin-based lazy design for
-         * now; the remaining concurrent page-move race is tracked separately.
-         */
-        UnlockBuffer(buf);
+        tupno = pax_find_visible_tuple(scan, pdesc,
+                                       scan->current_tupno + 1);
 
         if (tupno >= 0)
         {
-            scan->current_buf = buf;
-            scan->current_pdesc = pdesc;
-            scan->current_tupno = tupno;
-            scan->current_block++;
+            /*
+             * Materialize before dropping the content lock.  A pin prevents
+             * eviction, but an inserter may still memmove this page while the
+             * slot is live; copied values are therefore mandatory.
+             */
             pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
+            ExecMaterializeSlot(slot);
+            pax_free_page_desc(pdesc);
+            UnlockReleaseBuffer(buf);
+
+            scan->current_tupno = tupno;
             return true;
         }
 
         pax_free_page_desc(pdesc);
-        ReleaseBuffer(buf);
+        UnlockReleaseBuffer(buf);
+        scan->current_tupno = -1;
         scan->current_block++;
+    }
+
+    return false;
+}
+
+static void
+pax_scan_set_tidrange(TableScanDesc sscan, ItemPointer mintid,
+                      ItemPointer maxtid)
+{
+    PaxScanDesc scan = (PaxScanDesc) sscan;
+
+    scan->tidrange_done = false;
+    scan->current_tupno = -1;
+    scan->current_block = 0;
+    scan->nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
+
+    if (ItemPointerIsValid(mintid))
+    {
+        scan->current_block = ItemPointerGetBlockNumber(mintid);
+        if (OffsetNumberIsValid(ItemPointerGetOffsetNumber(mintid)))
+            scan->current_tupno =
+                (int) ItemPointerGetOffsetNumber(mintid) - 2;
+    }
+
+    if (ItemPointerIsValid(maxtid))
+    {
+        if (ItemPointerIsValid(mintid) &&
+            ItemPointerCompare(mintid, maxtid) > 0)
+        {
+            scan->tidrange_done = true;
+            return;
+        }
+        scan->tidrange_max = *maxtid;
+    }
+    else
+        ItemPointerSetInvalid(&scan->tidrange_max);
+
+    if (scan->current_block >= scan->nblocks)
+        scan->tidrange_done = true;
+}
+
+static bool
+pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
+                              TupleTableSlot *slot)
+{
+    PaxScanDesc scan = (PaxScanDesc) sscan;
+    Relation    rel = scan->rs_base.rs_rd;
+    TupleDesc   tupdesc = RelationGetDescr(rel);
+
+    if (direction != ForwardScanDirection &&
+        direction != NoMovementScanDirection)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support backward TID scans")));
+
+    ExecClearTuple(slot);
+
+    while (!scan->tidrange_done && scan->current_block < scan->nblocks)
+    {
+        Buffer       buf;
+        Page         page;
+        PaxPageDesc *pdesc;
+        int          start = scan->current_tupno + 1;
+        int          tupno;
+        BlockNumber  max_block = InvalidBlockNumber;
+
+        CHECK_FOR_INTERRUPTS();
+
+        if (ItemPointerIsValid(&scan->tidrange_max))
+        {
+            max_block = ItemPointerGetBlockNumber(&scan->tidrange_max);
+            if (scan->current_block > max_block)
+            {
+                scan->tidrange_done = true;
+                break;
+            }
+            if (scan->current_block == max_block &&
+                start > (int) ItemPointerGetOffsetNumber(&scan->tidrange_max))
+            {
+                scan->tidrange_done = true;
+                break;
+            }
+        }
+
+        buf = ReadBuffer(rel, scan->current_block);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buf);
+        if (!pax_page_is_valid(page))
+        {
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 scan->current_block, RelationGetRelationName(rel));
+        }
+
+        pdesc = pax_build_page_desc(page, tupdesc);
+        tupno = pax_find_visible_tuple(scan, pdesc, start);
+        if (tupno >= 0 &&
+            ItemPointerIsValid(&scan->tidrange_max) &&
+            scan->current_block == max_block &&
+            tupno + 1 > (int) ItemPointerGetOffsetNumber(&scan->tidrange_max))
+            tupno = -1;
+
+        if (tupno >= 0)
+        {
+            pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
+            ExecMaterializeSlot(slot);
+            pax_free_page_desc(pdesc);
+            UnlockReleaseBuffer(buf);
+            scan->current_tupno = tupno;
+            return true;
+        }
+
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+        scan->current_tupno = -1;
+        if (ItemPointerIsValid(&scan->tidrange_max) &&
+            scan->current_block == max_block)
+            scan->tidrange_done = true;
+        else
+            scan->current_block++;
     }
 
     return false;
@@ -1397,8 +1843,7 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  *   memmove vers la droite (pd_lower montante),
  * - pose le bit de NULL dans le bitmap de chaque colonne.
  *
- * Reste à faire : Generic WAL, gestion FSM, versions UPDATE/DELETE et
- * vacuum.
+ * Reste à faire : Generic WAL, gestion FSM et vacuum.
  */
 #if PG_VERSION_NUM >= 190000
 static void
@@ -1527,10 +1972,24 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
     if (!BufferIsValid(buf))
     {
+        /*
+         * P_NEW does not itself serialize relation extension.  The extension
+         * lock prevents two PAX inserters from concurrently resolving the
+         * same new block before either has initialized it.
+         */
+        LockRelationForExtension(rel, ExclusiveLock);
         buf = ReadBuffer(rel, P_NEW);
         LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
         page = BufferGetPage(buf);
+        if (!PageIsNew(page))
+        {
+            UnlockReleaseBuffer(buf);
+            UnlockRelationForExtension(rel, ExclusiveLock);
+            elog(ERROR, "pax: concurrent extension returned a non-new page");
+        }
         pax_page_init(page, natts);
+        UnlockRelationForExtension(rel, ExclusiveLock);
+
         needed = pax_insert_space_needed(rel, values, isnulls, 0);
         available = pax_page_free_space(page);
         if (available < needed)
@@ -1591,6 +2050,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     meta->xmax = InvalidTransactionId;
     meta->cmin = cid;
     meta->cmax = InvalidCommandId;
+    meta->locker_mxid = InvalidMultiXactId;
 
     /* === 4. Une région par colonne : [bitmap de NULL][valeurs] === */
     for (i = 0; i < natts; i++)
@@ -1683,6 +2143,8 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     /* TID : offset de TID = tupno + 1 (les offsets de TID débutent à 1) */
     ItemPointerSet(&(slot->tts_tid), BufferGetBlockNumber(buf),
                    (OffsetNumber) (tupno + 1));
+    ItemPointerCopy(&slot->tts_tid, &meta->t_ctid);
+    meta->flags = 0;
     slot->tts_tableOid = RelationGetRelid(rel);
     if (slot->tts_ops == &TTSOpsPax)
     {
@@ -1700,6 +2162,880 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     pfree(values);
     pfree(isnulls);
     pfree(voffs);
+}
+
+/* ------------------------------------------------------------------ */
+/* Versioned UPDATE / DELETE / row locking                             */
+/* ------------------------------------------------------------------ */
+
+static PaxTupleMetaData *
+pax_page_tuple_meta(Page page, int tupno)
+{
+    PaxPageHeader *phdr = PaxPageHeaderPtr(page);
+
+    Assert(tupno >= 0 && tupno < phdr->n_tuples);
+    Assert(PaxOffsetIsValid(phdr->meta_offset));
+    return ((PaxTupleMetaData *) ((char *) page + phdr->meta_offset)) + tupno;
+}
+
+typedef struct PaxLockerState
+{
+    bool            current_found;
+    LockTupleMode   current_mode;
+    bool            active_any;
+    TransactionId   conflict_xid;
+} PaxLockerState;
+
+static MultiXactStatus
+pax_multixact_status_for_mode(LockTupleMode mode)
+{
+    switch (mode)
+    {
+        case LockTupleKeyShare:
+            return MultiXactStatusForKeyShare;
+        case LockTupleShare:
+            return MultiXactStatusForShare;
+        case LockTupleNoKeyExclusive:
+            return MultiXactStatusForNoKeyUpdate;
+        case LockTupleExclusive:
+            return MultiXactStatusForUpdate;
+    }
+
+    elog(ERROR, "pax: invalid tuple lock mode %d", (int) mode);
+    return MultiXactStatusForKeyShare;
+}
+
+static bool
+pax_lock_modes_conflict(LockTupleMode existing, LockTupleMode requested)
+{
+    if (existing == LockTupleKeyShare)
+        return requested == LockTupleExclusive;
+    if (existing == LockTupleShare)
+        return requested >= LockTupleNoKeyExclusive;
+    if (existing == LockTupleNoKeyExclusive)
+        return requested >= LockTupleShare;
+    return true;
+}
+
+static LockTupleMode
+pax_lock_mode_from_multixact(MultiXactStatus status)
+{
+    switch (status)
+    {
+        case MultiXactStatusForKeyShare:
+            return LockTupleKeyShare;
+        case MultiXactStatusForShare:
+            return LockTupleShare;
+        case MultiXactStatusForNoKeyUpdate:
+            return LockTupleNoKeyExclusive;
+        case MultiXactStatusForUpdate:
+            return LockTupleExclusive;
+        case MultiXactStatusNoKeyUpdate:
+        case MultiXactStatusUpdate:
+            elog(ERROR, "pax: update status found in lock-only MultiXact");
+    }
+
+    elog(ERROR, "pax: invalid lock-only MultiXact status %d", (int) status);
+    return LockTupleKeyShare;
+}
+
+static TransactionId
+pax_locker_xmax(const PaxTupleMetaData *meta)
+{
+    if (TransactionIdIsValid(meta->xmax))
+        return meta->xmax;
+    if (MultiXactIdIsValid(meta->locker_mxid))
+        return (TransactionId) meta->locker_mxid;
+    return InvalidTransactionId;
+}
+
+static void
+pax_get_locker_state(const PaxTupleMetaData *meta, LockTupleMode requested,
+                     PaxLockerState *state)
+{
+    MultiXactMember *members = NULL;
+    int         nmembers;
+    int         i;
+
+    memset(state, 0, sizeof(*state));
+    state->current_mode = LockTupleKeyShare;
+    state->conflict_xid = InvalidTransactionId;
+
+    if (!MultiXactIdIsValid(meta->locker_mxid))
+        return;
+
+    nmembers = GetMultiXactIdMembers(meta->locker_mxid, &members, false, true);
+    for (i = 0; i < nmembers; i++)
+    {
+        LockTupleMode member_mode = pax_lock_mode_from_multixact(members[i].status);
+
+        if (TransactionIdIsCurrentTransactionId(members[i].xid))
+        {
+            state->active_any = true;
+            if (!state->current_found || member_mode > state->current_mode)
+            {
+                state->current_found = true;
+                state->current_mode = member_mode;
+            }
+        }
+        else if (TransactionIdIsInProgress(members[i].xid))
+        {
+            state->active_any = true;
+            if (pax_lock_modes_conflict(member_mode, requested))
+            {
+                state->conflict_xid = members[i].xid;
+                break;
+            }
+        }
+    }
+
+    if (members)
+        pfree(members);
+}
+
+static MultiXactId
+pax_add_persistent_locker(const PaxTupleMetaData *meta, LockTupleMode mode,
+                         bool *changed)
+{
+    PaxLockerState state;
+    MultiXactStatus status = pax_multixact_status_for_mode(mode);
+    MultiXactId result;
+
+    pax_get_locker_state(meta, mode, &state);
+    if (state.current_found && state.current_mode >= mode)
+    {
+        *changed = false;
+        return meta->locker_mxid;
+    }
+
+    MultiXactIdSetOldestMember();
+    if (state.active_any)
+        result = MultiXactIdExpand(meta->locker_mxid,
+                                   GetCurrentTransactionId(), status);
+    else
+    {
+        MultiXactMember member;
+
+        member.xid = GetCurrentTransactionId();
+        member.status = status;
+        result = MultiXactIdCreateFromMembers(1, &member);
+    }
+
+    *changed = true;
+    return result;
+}
+
+static void
+pax_set_locker_mxid(Relation rel, const ItemPointerData *tid,
+                    MultiXactId locker_mxid,
+                    PaxTupleMetaData *updated_meta)
+{
+    BlockNumber blkno = ItemPointerGetBlockNumber(tid);
+    OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
+    Buffer buf;
+    PaxPageDesc *pdesc;
+    PaxTupleMetaData meta;
+    int tupno;
+
+    buf = ReadBuffer(rel, blkno);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    if (!pax_page_is_valid(BufferGetPage(buf)))
+    {
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: invalid page %u while storing tuple locks",
+             blkno);
+    }
+
+    pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+    tupno = (int) offset - 1;
+    if (tupno < 0 || tupno >= pdesc->n_tuples)
+    {
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: tuple offset does not exist while storing locks");
+    }
+    meta = pdesc->tuple_meta[tupno];
+    pax_free_page_desc(pdesc);
+
+    if (meta.locker_mxid == locker_mxid)
+    {
+        if (updated_meta != NULL)
+            *updated_meta = meta;
+        UnlockReleaseBuffer(buf);
+        return;
+    }
+
+    meta.locker_mxid = locker_mxid;
+    *pax_page_tuple_meta(BufferGetPage(buf), tupno) = meta;
+    if (updated_meta != NULL)
+        *updated_meta = meta;
+    MarkBufferDirty(buf);
+    UnlockReleaseBuffer(buf);
+}
+
+typedef enum PaxVersionStatus
+{
+    PaxVersionLive,
+    PaxVersionInvisible,
+    PaxVersionSelfModified,
+    PaxVersionInProgress,
+    PaxVersionUpdated,
+    PaxVersionDeleted
+} PaxVersionStatus;
+
+static PaxVersionStatus
+pax_classify_version(const PaxTupleMetaData *meta,
+                     const ItemPointerData *self_tid, CommandId cid)
+{
+    if (TransactionIdIsCurrentTransactionId(meta->xmin))
+    {
+        if (meta->cmin >= cid)
+            return PaxVersionInvisible;
+    }
+    else if (meta->xmin != FrozenTransactionId &&
+             meta->xmin != BootstrapTransactionId &&
+             (TransactionIdIsInProgress(meta->xmin) ||
+              !TransactionIdDidCommit(meta->xmin)))
+        return PaxVersionInvisible;
+
+    if (!TransactionIdIsValid(meta->xmax))
+        return PaxVersionLive;
+
+    if (TransactionIdIsCurrentTransactionId(meta->xmax))
+        return meta->cmax >= cid ?
+            PaxVersionSelfModified : PaxVersionInvisible;
+
+    if (TransactionIdIsInProgress(meta->xmax))
+        return PaxVersionInProgress;
+
+    if (TransactionIdDidCommit(meta->xmax))
+        return ItemPointerEquals(self_tid, &meta->t_ctid) ?
+            PaxVersionDeleted : PaxVersionUpdated;
+
+    /* The outdating transaction aborted; this physical version is live. */
+    return PaxVersionLive;
+}
+
+static void
+pax_fill_failure_data(TM_FailureData *tmfd,
+                      const PaxTupleMetaData *meta,
+                      TM_Result result, bool traversed)
+{
+    tmfd->ctid = meta->t_ctid;
+    tmfd->xmax = meta->xmax;
+    tmfd->cmax = result == TM_SelfModified ? meta->cmax : InvalidCommandId;
+    tmfd->traversed = traversed;
+}
+
+static LOCKMODE
+pax_lockmode_for_tuple_mode(LockTupleMode mode)
+{
+    switch (mode)
+    {
+        case LockTupleKeyShare:
+            return AccessShareLock;
+        case LockTupleShare:
+            return RowShareLock;
+        case LockTupleNoKeyExclusive:
+            return ExclusiveLock;
+        case LockTupleExclusive:
+            return AccessExclusiveLock;
+    }
+
+    elog(ERROR, "pax: invalid tuple lock mode %d", (int) mode);
+    return NoLock;
+}
+
+static bool
+pax_acquire_dml_tuplock(Relation rel, const ItemPointerData *tid, bool wait)
+{
+    if (wait)
+    {
+        LockTuple(rel, tid, AccessExclusiveLock);
+        return true;
+    }
+
+    return ConditionalLockTuple(rel, tid, AccessExclusiveLock, false);
+}
+
+/*
+ * Acquire the heavyweight tuple lock, then return the exact physical version
+ * with its page content lock held.  The heavyweight lock closes the race
+ * between dropping the content lock to wait for an outdating xact and another
+ * writer changing the same tuple.
+ */
+static TM_Result
+pax_lock_version_for_dml(Relation rel, const ItemPointerData *tid,
+                         CommandId cid, Snapshot crosscheck, bool wait,
+                         XLTW_Oper wait_op, TM_FailureData *tmfd,
+                         Buffer *buffer, PaxPageDesc **pdesc,
+                         PaxTupleMetaData *meta, ItemPointerData *self_tid,
+                         bool *have_tuplock)
+{
+    bool have_lock;
+
+    if (!ItemPointerIsValid(tid))
+        elog(ERROR, "pax: invalid tuple identifier for UPDATE/DELETE");
+
+    have_lock = pax_acquire_dml_tuplock(rel, tid, wait);
+    if (!have_lock)
+    {
+        ItemPointerCopy(tid, &tmfd->ctid);
+        tmfd->xmax = InvalidTransactionId;
+        tmfd->cmax = InvalidCommandId;
+        tmfd->traversed = false;
+        return TM_BeingModified;
+    }
+
+    for (;;)
+    {
+        BlockNumber  blkno = ItemPointerGetBlockNumber(tid);
+        OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
+        PaxVersionStatus status;
+        Buffer       buf;
+        Page         page;
+        PaxPageDesc *desc;
+        int          tupno;
+
+        if (blkno >= RelationGetNumberOfBlocks(rel) ||
+            !OffsetNumberIsValid(offset))
+            elog(ERROR, "pax: tuple identifier outside relation \"%s\"",
+                 RelationGetRelationName(rel));
+
+        buf = ReadBuffer(rel, blkno);
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        page = BufferGetPage(buf);
+        if (!pax_page_is_valid(page))
+        {
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 blkno, RelationGetRelationName(rel));
+        }
+
+        desc = pax_build_page_desc(page, RelationGetDescr(rel));
+        tupno = (int) offset - 1;
+        if (tupno >= desc->n_tuples)
+        {
+            pax_free_page_desc(desc);
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: tuple offset does not exist in relation \"%s\"",
+                 RelationGetRelationName(rel));
+        }
+
+        *meta = desc->tuple_meta[tupno];
+        ItemPointerSet(self_tid, blkno, offset);
+        status = pax_classify_version(meta, self_tid, cid);
+
+        if (status == PaxVersionLive)
+        {
+            PaxLockerState locker_state;
+
+            pax_get_locker_state(meta, LockTupleExclusive, &locker_state);
+            if (TransactionIdIsValid(locker_state.conflict_xid))
+            {
+                if (wait)
+                {
+                    TransactionId xwait = locker_state.conflict_xid;
+
+                    pax_free_page_desc(desc);
+                    UnlockReleaseBuffer(buf);
+                    UnlockTuple(rel, self_tid, AccessExclusiveLock);
+                    XactLockTableWait(xwait, rel, self_tid, wait_op);
+                    LockTuple(rel, self_tid, AccessExclusiveLock);
+                    continue;
+                }
+
+                meta->xmax = locker_state.conflict_xid;
+                status = PaxVersionInProgress;
+            }
+        }
+
+        if (status == PaxVersionLive &&
+            crosscheck != InvalidSnapshot &&
+            !pax_meta_satisfies_snapshot(meta, crosscheck))
+            status = PaxVersionUpdated;
+
+        if (status == PaxVersionLive)
+        {
+            *buffer = buf;
+            *pdesc = desc;
+            *have_tuplock = true;
+            return TM_Ok;
+        }
+
+        if (status == PaxVersionInProgress && wait)
+        {
+            TransactionId xwait = meta->xmax;
+
+            pax_free_page_desc(desc);
+            UnlockReleaseBuffer(buf);
+            XactLockTableWait(xwait, rel, self_tid, wait_op);
+            continue;
+        }
+
+        {
+            TM_Result result;
+
+            switch (status)
+            {
+                case PaxVersionInvisible:
+                    result = TM_Invisible;
+                    break;
+                case PaxVersionSelfModified:
+                    result = TM_SelfModified;
+                    break;
+                case PaxVersionInProgress:
+                    result = TM_BeingModified;
+                    break;
+                case PaxVersionUpdated:
+                    result = TM_Updated;
+                    break;
+                case PaxVersionDeleted:
+                    result = TM_Deleted;
+                    break;
+                case PaxVersionLive:
+                    pg_unreachable();
+            }
+
+            pax_fill_failure_data(tmfd, meta, result, false);
+            pax_free_page_desc(desc);
+            UnlockReleaseBuffer(buf);
+            UnlockTuple(rel, tid, AccessExclusiveLock);
+            return result;
+        }
+    }
+}
+
+static TM_Result
+pax_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
+                 uint32 options, Snapshot snapshot, Snapshot crosscheck,
+                 bool wait, TM_FailureData *tmfd)
+{
+    Buffer          buf = InvalidBuffer;
+    PaxPageDesc    *pdesc = NULL;
+    PaxTupleMetaData meta;
+    ItemPointerData self_tid;
+    bool            have_tuplock = false;
+    TransactionId   xid;
+    TM_Result       result;
+
+    if (IsInParallelMode())
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                 errmsg("cannot delete tuples during a parallel operation")));
+    if (cid == InvalidCommandId)
+        elog(ERROR, "pax: invalid DELETE command ID");
+    if (!wait)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support non-waiting DELETE")));
+    if (options & TABLE_DELETE_CHANGING_PARTITION)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support partition-row moves")));
+
+    (void) snapshot;
+    xid = GetCurrentTransactionId();
+    tmfd->traversed = false;
+    result = pax_lock_version_for_dml(rel, tid, cid, crosscheck, wait,
+                                      XLTW_Delete, tmfd, &buf, &pdesc,
+                                      &meta, &self_tid, &have_tuplock);
+    if (result == TM_Invisible)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("attempted to delete invisible tuple")));
+    if (result != TM_Ok)
+        return result;
+
+    CheckForSerializableConflictIn(rel, tid,
+                                   ItemPointerGetBlockNumber(&self_tid));
+
+    meta.xmax = xid;
+    meta.cmax = cid;
+    ItemPointerCopy(&self_tid, &meta.t_ctid);
+    *pax_page_tuple_meta(BufferGetPage(buf),
+                          ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
+    MarkBufferDirty(buf);
+
+    pax_free_page_desc(pdesc);
+    UnlockReleaseBuffer(buf);
+    if (have_tuplock)
+        UnlockTuple(rel, &self_tid, AccessExclusiveLock);
+
+    return TM_Ok;
+}
+
+static TM_Result
+pax_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
+                 CommandId cid, uint32 options, Snapshot snapshot,
+                 Snapshot crosscheck, bool wait, TM_FailureData *tmfd,
+                 LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+{
+    Buffer          buf = InvalidBuffer;
+    PaxPageDesc    *pdesc = NULL;
+    PaxTupleMetaData meta;
+    PaxTupleMetaData new_meta;
+    ItemPointerData self_tid;
+    ItemPointerData new_tid;
+    MultiXactId    carry_locker_mxid = InvalidMultiXactId;
+    PaxLockerState locker_state;
+    PaxTupleTableSlot *pslot = NULL;
+    bool            have_tuplock = false;
+    TransactionId   xid;
+    TM_Result       result;
+
+    if (IsInParallelMode())
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                 errmsg("cannot update tuples during a parallel operation")));
+    if (cid == InvalidCommandId)
+        elog(ERROR, "pax: invalid UPDATE command ID");
+    if (!wait)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support non-waiting UPDATE")));
+    (void) options;
+    (void) snapshot;
+
+    *lockmode = LockTupleExclusive;
+    *update_indexes = TU_None;
+    tmfd->traversed = false;
+
+    /* The new values may be backed by another PAX page; detach them first. */
+    ExecMaterializeSlot(slot);
+
+    xid = GetCurrentTransactionId();
+    result = pax_lock_version_for_dml(rel, otid, cid, crosscheck, wait,
+                                      XLTW_Update, tmfd, &buf, &pdesc,
+                                      &meta, &self_tid, &have_tuplock);
+    if (result == TM_Invisible)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("attempted to update invisible tuple")));
+    if (result != TM_Ok)
+        return result;
+
+    pax_get_locker_state(&meta, LockTupleExclusive, &locker_state);
+    if (locker_state.current_found)
+        carry_locker_mxid = meta.locker_mxid;
+
+    CheckForSerializableConflictIn(rel, otid,
+                                   ItemPointerGetBlockNumber(&self_tid));
+
+    /*
+     * Reserve the old version first.  While xmax names our in-progress xact,
+     * another writer cannot advance the chain.  Insert the replacement between
+     * that reservation and publication of the forward t_ctid link.
+     */
+    meta.xmax = xid;
+    meta.cmax = cid;
+    ItemPointerCopy(&self_tid, &meta.t_ctid);
+    *pax_page_tuple_meta(BufferGetPage(buf),
+                          ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
+    MarkBufferDirty(buf);
+    pax_free_page_desc(pdesc);
+    UnlockReleaseBuffer(buf);
+
+    pax_tuple_insert(rel, slot, cid, 0, NULL);
+    new_tid = slot->tts_tid;
+    if (MultiXactIdIsValid(carry_locker_mxid))
+    {
+        if (slot->tts_ops == &TTSOpsPax)
+            pslot = (PaxTupleTableSlot *) slot;
+        pax_set_locker_mxid(rel, &new_tid, carry_locker_mxid,
+                            pslot != NULL ? &new_meta : NULL);
+        if (pslot != NULL)
+        {
+            pslot->has_tuple_meta = true;
+            pslot->tuple_meta = new_meta;
+        }
+    }
+
+    /* Re-find the old version because insertion may have moved its metadata. */
+    buf = ReadBuffer(rel, ItemPointerGetBlockNumber(&self_tid));
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    if (!pax_page_is_valid(BufferGetPage(buf)))
+    {
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: invalid old-version page after UPDATE");
+    }
+    pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+    if ((int) ItemPointerGetOffsetNumber(&self_tid) - 1 >= pdesc->n_tuples)
+    {
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: old UPDATE version disappeared");
+    }
+    meta = pdesc->tuple_meta[ItemPointerGetOffsetNumber(&self_tid) - 1];
+    if (meta.xmax != xid || meta.cmax != cid ||
+        !ItemPointerEquals(&meta.t_ctid, &self_tid))
+    {
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: old UPDATE version changed unexpectedly");
+    }
+
+    ItemPointerCopy(&new_tid, &meta.t_ctid);
+    *pax_page_tuple_meta(BufferGetPage(buf),
+                          ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
+    MarkBufferDirty(buf);
+    pax_free_page_desc(pdesc);
+    UnlockReleaseBuffer(buf);
+
+    if (have_tuplock)
+        UnlockTuple(rel, &self_tid, AccessExclusiveLock);
+
+    slot->tts_tableOid = RelationGetRelid(rel);
+    *update_indexes = TU_All;
+    return TM_Ok;
+}
+
+static TM_Result
+pax_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
+               TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+               LockWaitPolicy wait_policy, uint8 flags,
+               TM_FailureData *tmfd)
+{
+    LOCKMODE        lockmode = pax_lockmode_for_tuple_mode(mode);
+    ItemPointerData current = *tid;
+    ItemPointerData locked_tid;
+    TransactionId   expected_xmin = InvalidTransactionId;
+    bool            have_tuplock = false;
+    bool            traversed = false;
+    uint64          hops = 0;
+
+    if (cid == InvalidCommandId)
+        elog(ERROR, "pax: invalid row-lock command ID");
+    (void) snapshot;
+
+    ItemPointerSetInvalid(&locked_tid);
+    tmfd->traversed = false;
+
+    for (;;)
+    {
+        BlockNumber  blkno;
+        BlockNumber  nblocks = RelationGetNumberOfBlocks(rel);
+        OffsetNumber offset;
+        uint64       max_hops = ((uint64) nblocks + 1) * MaxOffsetNumber;
+        Buffer       buf;
+        PaxPageDesc *pdesc;
+        PaxTupleMetaData meta;
+        PaxVersionStatus status;
+
+        if (!ItemPointerIsValid(&current))
+            elog(ERROR, "pax: invalid tuple identifier in lock request");
+        if (++hops > max_hops)
+            elog(ERROR, "pax: tuple version chain is cyclic or too long");
+
+        blkno = ItemPointerGetBlockNumber(&current);
+        offset = ItemPointerGetOffsetNumber(&current);
+        if (blkno >= nblocks || !OffsetNumberIsValid(offset))
+            elog(ERROR, "pax: tuple identifier outside relation \"%s\"",
+                 RelationGetRelationName(rel));
+
+        buf = ReadBuffer(rel, blkno);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        if (!pax_page_is_valid(BufferGetPage(buf)))
+        {
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 blkno, RelationGetRelationName(rel));
+        }
+        pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+        if ((int) offset - 1 >= pdesc->n_tuples)
+        {
+            pax_free_page_desc(pdesc);
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: tuple offset does not exist in relation \"%s\"",
+                 RelationGetRelationName(rel));
+        }
+        meta = pdesc->tuple_meta[offset - 1];
+        status = pax_classify_version(&meta, &current, cid);
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+
+        if (TransactionIdIsValid(expected_xmin) &&
+            meta.xmin != expected_xmin)
+        {
+            if (have_tuplock)
+            {
+                UnlockTuple(rel, &locked_tid, lockmode);
+                have_tuplock = false;
+            }
+            ItemPointerCopy(&current, &tmfd->ctid);
+            tmfd->xmax = expected_xmin;
+            tmfd->cmax = InvalidCommandId;
+            tmfd->traversed = traversed;
+            *tid = current;
+            return TM_Deleted;
+        }
+
+        if (status == PaxVersionLive)
+        {
+            PaxLockerState locker_state;
+            MultiXactId new_locker_mxid;
+            bool locker_changed;
+
+            if (!have_tuplock || !ItemPointerEquals(&locked_tid, &current))
+            {
+                switch (wait_policy)
+                {
+                    case LockWaitBlock:
+                        LockTuple(rel, &current, lockmode);
+                        break;
+                    case LockWaitSkip:
+                        if (!ConditionalLockTuple(rel, &current, lockmode,
+                                                   false))
+                            return TM_WouldBlock;
+                        break;
+                    case LockWaitError:
+                        if (!ConditionalLockTuple(rel, &current, lockmode,
+                                                   true))
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                     errmsg("could not obtain lock on row in relation \"%s\"",
+                                            RelationGetRelationName(rel))));
+                        break;
+                }
+                locked_tid = current;
+                have_tuplock = true;
+
+                /* An update may have won before the heavyweight lock. */
+                continue;
+            }
+
+            pax_get_locker_state(&meta, mode, &locker_state);
+            if (TransactionIdIsValid(locker_state.conflict_xid))
+            {
+                switch (wait_policy)
+                {
+                    case LockWaitBlock:
+                        UnlockTuple(rel, &locked_tid, lockmode);
+                        have_tuplock = false;
+                        XactLockTableWait(locker_state.conflict_xid, rel,
+                                          &current, XLTW_Lock);
+                        LockTuple(rel, &current, lockmode);
+                        locked_tid = current;
+                        have_tuplock = true;
+                        break;
+                    case LockWaitSkip:
+                        if (!ConditionalXactLockTableWait(
+                                locker_state.conflict_xid, false))
+                        {
+                            UnlockTuple(rel, &locked_tid, lockmode);
+                            have_tuplock = false;
+                            return TM_WouldBlock;
+                        }
+                        break;
+                    case LockWaitError:
+                        if (!ConditionalXactLockTableWait(
+                                locker_state.conflict_xid, true))
+                        {
+                            UnlockTuple(rel, &locked_tid, lockmode);
+                            have_tuplock = false;
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                     errmsg("could not obtain lock on row in relation \"%s\"",
+                                            RelationGetRelationName(rel))));
+                        }
+                        break;
+                }
+                continue;
+            }
+
+            new_locker_mxid = pax_add_persistent_locker(&meta, mode,
+                                                        &locker_changed);
+            if (locker_changed)
+                pax_set_locker_mxid(rel, &current, new_locker_mxid, NULL);
+
+            if (!pax_tuple_fetch_row_version(rel, &current, SnapshotAny, slot))
+                elog(ERROR, "pax: failed to fetch row while taking tuple lock");
+
+            UnlockTuple(rel, &locked_tid, lockmode);
+            have_tuplock = false;
+            *tid = current;
+            tmfd->traversed = traversed;
+            return TM_Ok;
+        }
+
+
+        if (status == PaxVersionUpdated &&
+            (flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) != 0)
+        {
+            if (have_tuplock)
+            {
+                UnlockTuple(rel, &locked_tid, lockmode);
+                have_tuplock = false;
+            }
+            expected_xmin = meta.xmax;
+            current = meta.t_ctid;
+            traversed = true;
+            continue;
+        }
+
+        if (status == PaxVersionInProgress)
+        {
+            switch (wait_policy)
+            {
+                case LockWaitBlock:
+                    XactLockTableWait(meta.xmax, rel, &current, XLTW_Lock);
+                    break;
+                case LockWaitSkip:
+                    if (!ConditionalXactLockTableWait(meta.xmax, false))
+                    {
+                        pax_fill_failure_data(tmfd, &meta,
+                                              TM_BeingModified, traversed);
+                        if (have_tuplock)
+                        {
+                            UnlockTuple(rel, &locked_tid, lockmode);
+                            have_tuplock = false;
+                        }
+                        return TM_WouldBlock;
+                    }
+                    break;
+                case LockWaitError:
+                    if (!ConditionalXactLockTableWait(meta.xmax, true))
+                        ereport(ERROR,
+                                (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                 errmsg("could not obtain lock on row in relation \"%s\"",
+                                        RelationGetRelationName(rel))));
+                    break;
+            }
+            continue;
+        }
+
+        {
+            TM_Result result;
+
+            switch (status)
+            {
+                case PaxVersionInvisible:
+                    result = TM_Invisible;
+                    break;
+                case PaxVersionSelfModified:
+                    result = TM_SelfModified;
+                    break;
+                case PaxVersionUpdated:
+                    result = TM_Updated;
+                    break;
+                case PaxVersionDeleted:
+                    result = TM_Deleted;
+                    break;
+                case PaxVersionInProgress:
+                case PaxVersionLive:
+                    pg_unreachable();
+            }
+
+            pax_fill_failure_data(tmfd, &meta, result, traversed);
+            if (have_tuplock)
+            {
+                UnlockTuple(rel, &locked_tid, lockmode);
+                have_tuplock = false;
+            }
+            *tid = current;
+            return result;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1746,9 +3082,11 @@ pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
         pax_meta_satisfies_snapshot(&pdesc->tuple_meta[tupno], snapshot);
 
     if (visible)
-        pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, true);
-    else
-        pax_free_page_desc(pdesc);
+    {
+        pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
+        ExecMaterializeSlot(slot);
+    }
+    pax_free_page_desc(pdesc);
 
     UnlockReleaseBuffer(buf);
     return visible;
@@ -1765,15 +3103,96 @@ pax_tuple_tid_valid(TableScanDesc sscan, ItemPointer tid)
 
     offset = ItemPointerGetOffsetNumber(tid);
     return OffsetNumberIsValid(offset) &&
-        ItemPointerGetBlockNumber(tid) < scan->nblocks;
+        ItemPointerGetBlockNumber(tid) <
+        RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
 }
 
 static void
 pax_tuple_get_latest_tid(TableScanDesc sscan, ItemPointer tid)
 {
-    if (!pax_tuple_tid_valid(sscan, tid))
-        elog(ERROR, "pax: invalid tuple identifier");
-    /* PAX has no update-version chain yet, so this TID is already latest. */
+    PaxScanDesc scan = (PaxScanDesc) sscan;
+    Relation    rel = scan->rs_base.rs_rd;
+    Snapshot    snapshot = scan->rs_base.rs_snapshot;
+    ItemPointerData current = *tid;
+    ItemPointerData last_visible;
+    TransactionId expected_xmin = InvalidTransactionId;
+    uint64      hops = 0;
+
+    ItemPointerSetInvalid(&last_visible);
+
+    for (;;)
+    {
+        BlockNumber  blkno;
+        BlockNumber  nblocks = RelationGetNumberOfBlocks(rel);
+        uint64       max_hops = ((uint64) nblocks + 1) * MaxOffsetNumber;
+        OffsetNumber offset;
+        int          tupno;
+        Buffer       buf;
+        PaxPageDesc *pdesc;
+        PaxTupleMetaData meta;
+        ItemPointerData next;
+        TransactionId xmax;
+        bool          follow;
+
+        if (!ItemPointerIsValid(&current))
+            elog(ERROR, "pax: invalid tuple identifier in version chain");
+        blkno = ItemPointerGetBlockNumber(&current);
+        offset = ItemPointerGetOffsetNumber(&current);
+        if (blkno >= nblocks || !OffsetNumberIsValid(offset))
+            elog(ERROR, "pax: tuple identifier outside relation in version chain");
+
+        if (++hops > max_hops)
+            elog(ERROR, "pax: tuple version chain is cyclic or too long");
+
+        buf = ReadBuffer(rel, blkno);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        if (!pax_page_is_valid(BufferGetPage(buf)))
+        {
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 blkno, RelationGetRelationName(rel));
+        }
+
+        pdesc = pax_build_page_desc(BufferGetPage(buf),
+                                    RelationGetDescr(rel));
+        tupno = (int) offset - 1;
+        if (tupno >= pdesc->n_tuples)
+        {
+            pax_free_page_desc(pdesc);
+            UnlockReleaseBuffer(buf);
+            elog(ERROR, "pax: tuple offset does not exist in version chain");
+        }
+        meta = pdesc->tuple_meta[tupno];
+        next = meta.t_ctid;
+        xmax = meta.xmax;
+        pax_free_page_desc(pdesc);
+        UnlockReleaseBuffer(buf);
+
+        if (TransactionIdIsValid(expected_xmin) &&
+            meta.xmin != expected_xmin)
+            elog(ERROR, "pax: update chain points to an unrelated tuple");
+
+        if (pax_meta_satisfies_snapshot(&meta, snapshot))
+            last_visible = current;
+
+        if (!ItemPointerEquals(&current, &next) &&
+            !TransactionIdIsValid(xmax))
+            elog(ERROR, "pax: nonself version link has no xmax");
+
+        follow = ItemPointerEquals(&current, &next) ? false :
+            (TransactionIdIsCurrentTransactionId(xmax) ||
+             (!TransactionIdIsInProgress(xmax) &&
+              TransactionIdDidCommit(xmax)));
+
+        if (!follow)
+        {
+            *tid = ItemPointerIsValid(&last_visible) ? last_visible : current;
+            return;
+        }
+
+        expected_xmin = xmax;
+        current = next;
+    }
 }
 
 static bool
@@ -1809,7 +3228,8 @@ pax_relation_set_new_filelocator(Relation rel,
 {
     SMgrRelation srel;
 
-    /* Pas de MVCC : même initialisation que heap, inoffensive ici. */
+    /* PAX stores transaction metadata per version; these catalog horizons
+     * remain conservative because freezing and vacuum are not implemented. */
     *freezeXid = RecentXmin;
     *minmulti  = GetOldestMultiXactId();
 
@@ -1852,7 +3272,8 @@ pax_relation_needs_toast_table(Relation rel)
 
 /* Surcoût par tuple / espace utilisable par page, pour l'estimateur du
  * planificateur : approximations, améliorables quand la page mûrira. */
-#define PAX_OVERHEAD_BYTES_PER_TUPLE  (2 * sizeof(OffsetNumber))
+#define PAX_OVERHEAD_BYTES_PER_TUPLE  \
+    (SizeOfPaxTupleMetaData + 2 * sizeof(OffsetNumber))
 #define PAX_USABLE_BYTES_PER_PAGE     \
     (BLCKSZ - SizeOfPageHeaderData - MAXALIGN(sizeof(PaxSpecialData)))
 
@@ -1876,6 +3297,7 @@ PG_FUNCTION_INFO_V1(pax_tableam_handler);
 Datum
 pax_tableam_handler(PG_FUNCTION_ARGS)
 {
+    pax_validate_table_am_routine();
     PG_RETURN_POINTER(&pax_methods);
 }
 

@@ -72,6 +72,16 @@ SELECT count(*) FROM tpax_copy;
 SELECT (SELECT count(*) FROM tpax) = (SELECT count(*) FROM tpax_copy) AS same_count;
 SELECT a, b FROM tpax_copy WHERE a = 1;
 
+-- COPY uses the required multi_insert callback; PAX implements it as the same
+-- columnar append path used by tuple_insert.
+CREATE TABLE tpax_copy_multi (a int, b text) USING pax;
+COPY tpax_copy_multi FROM STDIN;
+1	one
+2	two
+\.
+SELECT a, b FROM tpax_copy_multi ORDER BY a;
+DROP TABLE tpax_copy_multi;
+
 --
 -- one row covering every storage shape: by-value columns of length
 -- 1/2/4/8, by-reference fixed (uuid, interval), varlena (text, varchar,
@@ -109,8 +119,11 @@ SELECT count(*) FROM tpax_types;
 CREATE TABLE tpax_mvcc (id int) USING pax;
 INSERT INTO tpax_mvcc VALUES (0);
 
--- exact-TID fetch uses the same snapshot visibility routine
+-- exact-TID and TID-range scans use the versioned table-AM callbacks
 SELECT ctid, id FROM tpax_mvcc WHERE ctid = '(0,1)';
+SELECT array_agg(id ORDER BY id) AS tid_range_ids
+FROM tpax_mvcc
+WHERE ctid BETWEEN '(0,1)' AND '(0,1)';
 
 BEGIN;
 INSERT INTO tpax_mvcc VALUES (1);
@@ -140,6 +153,110 @@ SELECT id, xmin <> '0'::xid AS has_xmin, xmax = '0'::xid AS no_xmax
 FROM tpax_mvcc
 ORDER BY id;
 DROP TABLE tpax_mvcc;
+
+--
+-- versioned UPDATE / DELETE: old physical versions retain xmin/xmax/cmax
+-- and a forward t_ctid, while normal MVCC scans expose only the newest
+-- committed version.
+--
+CREATE TABLE tpax_dml (id int, payload text) USING pax;
+INSERT INTO tpax_dml VALUES (1, 'old'), (2, 'keep');
+SELECT ctid AS old_tid FROM tpax_dml WHERE id = 1 \gset
+
+UPDATE tpax_dml
+SET payload = 'new'
+WHERE id = 1
+RETURNING id, payload, ctid <> :'old_tid' AS relocated,
+          xmin <> '0'::xid AS has_xmin,
+          xmax = '0'::xid AS no_xmax,
+          cmin = cmax AS shared_command;
+SELECT array_agg(id ORDER BY id) AS ids,
+       array_agg(payload ORDER BY id) AS payloads
+FROM tpax_dml;
+
+BEGIN;
+UPDATE tpax_dml SET payload = 'rolled back' WHERE id = 1;
+SELECT payload FROM tpax_dml WHERE id = 1;
+ROLLBACK;
+SELECT payload FROM tpax_dml WHERE id = 1;
+
+-- a second update follows the version chain; rolling back the subtransaction
+-- restores the version written by the first update
+BEGIN;
+UPDATE tpax_dml SET payload = 'first' WHERE id = 1;
+SAVEPOINT pax_update_sp;
+UPDATE tpax_dml SET payload = 'second' WHERE id = 1;
+SELECT payload FROM tpax_dml WHERE id = 1;
+ROLLBACK TO pax_update_sp;
+SELECT payload FROM tpax_dml WHERE id = 1;
+COMMIT;
+SELECT payload FROM tpax_dml WHERE id = 1;
+
+-- A current logical row lock is carried to the replacement version and is
+-- reflected by the UPDATE RETURNING slot.  Heavyweight tuple locks are only
+-- short-lived waiter arbitration and are not retained.
+BEGIN;
+SELECT id FROM tpax_dml WHERE id = 2 FOR UPDATE;
+UPDATE tpax_dml SET payload = 'carried lock'
+WHERE id = 2
+RETURNING payload, xmax <> '0'::xid AS lock_visible;
+SELECT count(*) = 0 AS no_heavyweight_tuple_lock
+FROM pg_locks WHERE locktype = 'tuple';
+ROLLBACK;
+SELECT payload FROM tpax_dml WHERE id = 2;
+
+DELETE FROM tpax_dml
+WHERE id = 1
+RETURNING id, payload,
+          xmax = pg_current_xact_id()::text::xid AS deleting_xid,
+          cmax IS NOT NULL AS has_cmax;
+SELECT array_agg(id ORDER BY id) AS remaining_ids FROM tpax_dml;
+
+BEGIN;
+DELETE FROM tpax_dml WHERE id = 2;
+SELECT count(*) AS visible_during_delete FROM tpax_dml;
+ROLLBACK;
+SELECT array_agg(id ORDER BY id) AS ids_after_rollback FROM tpax_dml;
+
+-- A replacement that cannot fit is rejected after reserving the old version;
+-- rolling back that subtransaction makes the old version current again.
+BEGIN;
+SAVEPOINT pax_large_update_sp;
+UPDATE tpax_dml SET payload = repeat('x', 10000) WHERE id = 2;
+ROLLBACK TO pax_large_update_sp;
+SELECT payload FROM tpax_dml WHERE id = 2;
+COMMIT;
+
+-- Multiple join matches in one command produce TM_SelfModified after the
+-- first write; PostgreSQL must ignore the duplicate without a second version.
+UPDATE tpax_dml AS a
+SET payload = a.payload || ' once'
+FROM tpax_dml AS b
+WHERE a.id = b.id AND a.id = 2 AND b.id IN (2, 2);
+SELECT payload FROM tpax_dml WHERE id = 2;
+DELETE FROM tpax_dml AS a
+USING tpax_dml AS b
+WHERE a.id = b.id AND a.id = 2 AND b.id IN (2, 2);
+SELECT count(*) AS rows_after_duplicate_delete FROM tpax_dml;
+DROP TABLE tpax_dml;
+
+-- Force a replacement version onto another page and verify that the 32-bit
+-- block plus 16-bit offset t_ctid link is followed by later version locking.
+CREATE TABLE tpax_chain (id int, payload text) USING pax;
+INSERT INTO tpax_chain
+SELECT g, repeat('x', 50) FROM generate_series(0, 99) g;
+SELECT ctid AS old_tid FROM tpax_chain WHERE id = 0 \gset
+UPDATE tpax_chain
+SET payload = repeat('y', 7000)
+WHERE id = 0
+RETURNING length(payload) AS new_length,
+          split_part(trim(both '()' from ctid::text), ',', 1)::integer <>
+          split_part(trim(both '()' from :'old_tid'), ',', 1)::integer
+          AS changed_block;
+SELECT count(*) AS chain_rows,
+       max(length(payload)) FILTER (WHERE id = 0) AS updated_length
+FROM tpax_chain;
+DROP TABLE tpax_chain;
 
 -- TRUNCATE (relation_nontransactional_truncate callback)
 TRUNCATE tpax;
