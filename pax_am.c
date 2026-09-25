@@ -16,11 +16,10 @@
  *
  * Limitations :
  *   - pas de FSM réel (recherche first-fit linéaire sur les pages)
- *   - pas de MVCC (xmin/xmax non gérés : toute ligne est visible)
+ *   - MVCC d'insertion implémenté, mais pas de versions UPDATE / DELETE
  *   - pas de Generic WAL (perte potentielle en cas de crash)
- *   - pas de UPDATE / DELETE / index (callbacks NULL)
- *   - pas de vacuum
- *   - Generic WAL non implémenté
+ *   - pas de vacuum, ni de gel des tuples
+ *   - pas d'index, de parallélisme ou d'opérations DDL non réécrivantes
  *
  */
 
@@ -30,6 +29,9 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/parallel.h"
+#include "access/sysattr.h"
+#include "access/transam.h"
 #include "access/tupmacs.h"
 #include "access/xact.h"
 #include "catalog/pg_attribute.h"
@@ -45,6 +47,8 @@
 #include "storage/itemptr.h"
 #include "storage/lmgr.h"
 #include "storage/off.h"
+#include "storage/predicate.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -56,7 +60,8 @@
 /* extension */
 PG_MODULE_MAGIC;
 
-#define PAX_PAGE_VERSION            1
+#define PAX_PAGE_VERSION            2
+#define PAX_SPECIAL_MAGIC           0x5041 /* "PA" */
 
 #define PAX_FLAG_HAS_NULLS          0x0001
 #define PAX_FLAG_HAS_VARLENA        0x0002
@@ -81,15 +86,34 @@ typedef struct PaxSpecialData
     uint16      version;        /* PAX_PAGE_VERSION */
     uint16      flags;
     uint16      n_attrs;
-    uint16      reserved;
+    uint16      magic;
 } PaxSpecialData;
 
 #define SizeOfPaxSpecialData    MAXALIGN(sizeof(PaxSpecialData))
 
+/*
+ * Transaction metadata is stored columnarly, once per tuple, immediately
+ * before the user-column regions.  Command IDs are meaningful only while the
+ * corresponding transaction is current, but storing them separately keeps the
+ * visibility rules simple and leaves room for future xmax updates.
+ */
+typedef struct PaxTupleMetaData
+{
+    TransactionId xmin;
+    TransactionId xmax;
+    CommandId     cmin;
+    CommandId     cmax;
+} PaxTupleMetaData;
+
+#define SizeOfPaxTupleMetaData   MAXALIGN(sizeof(PaxTupleMetaData))
+
+StaticAssertDecl(sizeof(PaxTupleMetaData) == SizeOfPaxTupleMetaData,
+                 "PAX tuple metadata must have a fixed on-disk size");
+
 typedef struct PaxPageHeader
 {
     uint16      n_tuples;       /* nombre de tuples sur la page */
-    uint16      max_tuples;     /* capacité de la page (0 = non calculé) */
+    OffsetNumber meta_offset;   /* début de la région des métadonnées */
     uint16      free_space;     /* approximation car certains champs à taille variable */
     uint16      flags;
 
@@ -114,6 +138,7 @@ typedef struct PaxPageHeader
  */
 #define PaxOffsetIsValid(off) \
     ((off) != InvalidOffsetNumber && (off) < BLCKSZ)
+#define PAX_NO_REGION          (-1)
 
 /* ------------------------------------------------------------------ */
 /* Descripteurs en mémoire                                             */
@@ -136,6 +161,7 @@ typedef struct PaxPageDesc
     PaxSpecialData *special;
     PaxPageHeader  *header;
     PaxMinipage    *minipages;
+    PaxTupleMetaData *tuple_meta; /* copie indépendante de la page */
     int             n_attrs;
     int             n_tuples;
     MemoryContext   ctx;        /* contexte dans lequel le desc a été alloué */
@@ -151,8 +177,11 @@ typedef struct PaxTupleTableSlot
 
     Buffer          buffer;         /* pin détenu par CE slot */
     Page            page;           /* pointe dans le buffer ci-dessus */
-    PaxPageDesc    *pdesc;          /* EMPRUNTÉ au scan (PaxScanDesc) */
+    PaxPageDesc    *pdesc;          /* emprunté au scan ou détenu par le slot */
     int             tupno;          /* index dans la page */
+    bool            owns_pdesc;
+    bool            has_tuple_meta;
+    PaxTupleMetaData tuple_meta;
 
     /*
      * Les valeurs se rangent dans tts_values / tts_isnull 
@@ -171,6 +200,7 @@ typedef struct PaxScanDescData
     PaxPageDesc    *current_pdesc;
     int             current_tupno;
     BlockNumber     current_block;
+    BlockNumber     nblocks;
 } PaxScanDescData;
 
 typedef PaxScanDescData *PaxScanDesc;
@@ -190,15 +220,24 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 
 /* Size / page layout */
 static Size         pax_slot_stride(Form_pg_attribute attr);
+static Size         pax_bitmap_size(int n_tuples);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
                                             bool *isnulls, int tupno);
 static OffsetNumber pax_alloc_payload(Page page, Datum value, int16 attlen);
 static Size         pax_region_size(Page page, PaxPageHeader *phdr,
                                     int n_attrs, int i);
 static Size         pax_page_free_space(Page page);
+static Size         pax_meta_region_size(Page page, PaxPageHeader *phdr);
 static void         pax_insert_bytes(Page page, PaxPageHeader *phdr,
                                      int n_attrs, int region_idx,
                                      Size at, Size len);
+static bool         pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta,
+                                                Snapshot snapshot);
+static int          pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc,
+                                           int start);
+static void         pax_store_tuple_slot(Relation rel, TupleTableSlot *slot,
+                                          Buffer buffer, PaxPageDesc *pdesc,
+                                          int tupno, bool owns_pdesc);
 
 /* Slot callbacks */
 static const TupleTableSlotOps *pax_slot_callbacks(Relation rel);
@@ -227,6 +266,17 @@ static void         pax_scan_rescan(TableScanDesc sscan, ScanKey key,
 static bool         pax_scan_getnextslot(TableScanDesc sscan,
                                          ScanDirection direction,
                                          TupleTableSlot *slot);
+
+/* Tuple lookup / visibility */
+static bool         pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
+                                                 Snapshot snapshot,
+                                                 TupleTableSlot *slot);
+static bool         pax_tuple_tid_valid(TableScanDesc sscan, ItemPointer tid);
+static void         pax_tuple_get_latest_tid(TableScanDesc sscan,
+                                             ItemPointer tid);
+static bool         pax_tuple_satisfies_snapshot(Relation rel,
+                                                   TupleTableSlot *slot,
+                                                   Snapshot snapshot);
 
 /* Insert                   */
 /* le proto a changé en v19 */
@@ -273,6 +323,12 @@ static const TableAmRoutine pax_methods = {
     .scan_rescan    = pax_scan_rescan,
     .scan_getnextslot = pax_scan_getnextslot,
 
+    /* Tuple lookup / MVCC visibility */
+    .tuple_fetch_row_version = pax_tuple_fetch_row_version,
+    .tuple_tid_valid = pax_tuple_tid_valid,
+    .tuple_get_latest_tid = pax_tuple_get_latest_tid,
+    .tuple_satisfies_snapshot = pax_tuple_satisfies_snapshot,
+
     /* Insert (minimal) */
     .tuple_insert   = pax_tuple_insert,
 
@@ -301,15 +357,15 @@ pax_page_init(Page page, int n_attrs)
     Size            header_size;
     int             i;
 
-    Assert(n_attrs > 0 && n_attrs <= MaxTupleAttributeNumber);
+    Assert(n_attrs >= 0 && n_attrs <= MaxTupleAttributeNumber);
 
     PageInit(page, BLCKSZ, SizeOfPaxSpecialData);
 
     special = (PaxSpecialData *) PageGetSpecialPointer(page);
     special->version  = PAX_PAGE_VERSION;
-    special->flags    = 0;
+    special->flags    = PAX_FLAG_HAS_XMIN_XMAX;
     special->n_attrs  = (uint16) n_attrs;
-    special->reserved = 0;
+    special->magic = PAX_SPECIAL_MAGIC;
 
     header_size = SizeOfPaxPageHeaderFixed + n_attrs * sizeof(OffsetNumber);
     header_size = MAXALIGN(header_size);
@@ -317,15 +373,15 @@ pax_page_init(Page page, int n_attrs)
     phdr = (PaxPageHeader *) ((char *) page + SizeOfPageHeaderData + SizeOfPaxSpecialData);
 
     phdr->n_tuples   = 0;
-    phdr->max_tuples = 0;
     phdr->free_space = (uint16) (BLCKSZ - (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size));
-    phdr->flags      = 0;
+    phdr->flags      = PAX_FLAG_HAS_XMIN_XMAX;
 
     for (i = 0; i < n_attrs; i++)
         phdr->offsets[i] = InvalidOffsetNumber;
 
     ((PageHeader) page)->pd_lower =
         (LocationIndex) (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size);
+    phdr->meta_offset = (OffsetNumber) ((PageHeader) page)->pd_lower;
 }
 
 static bool
@@ -337,7 +393,9 @@ pax_page_is_valid(Page page)
         return false;
 
     special = (PaxSpecialData *) PageGetSpecialPointer(page);
-    return (special->version == PAX_PAGE_VERSION);
+    return (special->version == PAX_PAGE_VERSION &&
+            special->magic == PAX_SPECIAL_MAGIC &&
+            (special->flags & PAX_FLAG_HAS_XMIN_XMAX) != 0);
 }
 
 /*
@@ -358,10 +416,15 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
 
     if (special->version != PAX_PAGE_VERSION)
         elog(ERROR, "pax: invalid page version %u", special->version);
+    if (special->magic != PAX_SPECIAL_MAGIC)
+        elog(ERROR, "pax: invalid page magic %u", special->magic);
 
     if (special->n_attrs != tupdesc->natts)
         elog(ERROR, "pax: attribute count mismatch (page %u vs tupdesc %d)",
              special->n_attrs, tupdesc->natts);
+
+    if ((special->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0)
+        elog(ERROR, "pax: page does not contain transaction metadata");
 
     phdr = PaxPageHeaderPtr(page);
 
@@ -372,6 +435,46 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
     desc->n_attrs  = special->n_attrs;
     desc->n_tuples = phdr->n_tuples;
     desc->ctx      = CurrentMemoryContext;
+
+    if ((phdr->flags & PAX_FLAG_HAS_XMIN_XMAX) == 0)
+        elog(ERROR, "pax: page header does not contain transaction metadata");
+
+    if (desc->n_tuples > 0)
+    {
+        Size expected = (Size) desc->n_tuples * SizeOfPaxTupleMetaData;
+        Size actual;
+
+        if (!PaxOffsetIsValid(phdr->meta_offset))
+            elog(ERROR, "pax: missing transaction metadata region");
+
+        actual = pax_meta_region_size(page, phdr);
+        if (actual != expected)
+            elog(ERROR, "pax: inconsistent transaction metadata region "
+                        "(region %zu, %d tuples x %zu)",
+                 actual, desc->n_tuples, SizeOfPaxTupleMetaData);
+
+        desc->tuple_meta = (PaxTupleMetaData *)
+            palloc(sizeof(PaxTupleMetaData) * desc->n_tuples);
+        memcpy(desc->tuple_meta,
+               (char *) page + phdr->meta_offset,
+               expected);
+
+        for (i = 0; i < desc->n_tuples; i++)
+        {
+            PaxTupleMetaData *meta = &desc->tuple_meta[i];
+
+            if (!TransactionIdIsValid(meta->xmin))
+                elog(ERROR, "pax: tuple %d has invalid xmin", i);
+            if (meta->cmin == InvalidCommandId)
+                elog(ERROR, "pax: tuple %d has invalid cmin", i);
+            if (!TransactionIdIsValid(meta->xmax) &&
+                meta->cmax != InvalidCommandId)
+                elog(ERROR, "pax: tuple %d has cmax without xmax", i);
+            if (TransactionIdIsValid(meta->xmax) &&
+                meta->cmax == InvalidCommandId)
+                elog(ERROR, "pax: tuple %d has xmax without cmax", i);
+        }
+    }
 
     desc->minipages = (PaxMinipage *) palloc0(sizeof(PaxMinipage) * desc->n_attrs);
 
@@ -411,10 +514,13 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
          * reste est la taille du bitmap (0 => absent).
          */
         bmp = rsize - (Size) desc->n_tuples * stride;
+        if (bmp != pax_bitmap_size(desc->n_tuples))
+            elog(ERROR, "pax: invalid NULL bitmap size for column %d "
+                        "(region %zu, tuples %d, bitmap %zu)",
+                 i, rsize, desc->n_tuples, bmp);
 
         if (bmp > 0)
         {
-      /* TODO: bits8 abandonné par la v19 */
             mp->null_bitmap = (bits8 *) (base + off);
             mp->has_nulls   = true;
         }
@@ -430,6 +536,8 @@ pax_free_page_desc(PaxPageDesc *desc)
     if (desc == NULL)
         return;
 
+    if (desc->tuple_meta)
+        pfree(desc->tuple_meta);
     if (desc->minipages)
         pfree(desc->minipages);
     pfree(desc);
@@ -530,6 +638,15 @@ pax_slot_stride(Form_pg_attribute attr)
     return MAXALIGN(sizeof(OffsetNumber));
 }
 
+static Size
+pax_bitmap_size(int n_tuples)
+{
+    if (n_tuples <= 0)
+        return 0;
+
+    return MAXALIGN(((Size) n_tuples + 7) / 8);
+}
+
 /*
  * Espace (borne supérieure) exigé pour insérer ce tuple dans une page qui
  * contient déjà "tupno" tuples. 
@@ -538,25 +655,41 @@ static Size
 pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls, int tupno)
 {
     TupleDesc   tupdesc = RelationGetDescr(rel);
-    Size        bitmap_need = MAXALIGN(((Size) tupno + 8) / 8);
-    Size        need = 0;
+    Size        bitmap_delta = pax_bitmap_size(tupno + 1) -
+        pax_bitmap_size(tupno);
+    Size        need = SizeOfPaxTupleMetaData;
+    Size        amount;
     int         i;
 
     for (i = 0; i < tupdesc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-        need += pax_slot_stride(attr);
-        need += bitmap_need;
+        amount = pax_slot_stride(attr) + bitmap_delta;
+        if (amount > MaxAllocSize - need)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pax: row size exceeds supported limits")));
+        need += amount;
 
         if (isnulls[i] || attr->attlen >= 0)
             continue;
 
         if (attr->attlen == -2)
-            need += MAXALIGN(strlen(DatumGetPointer(values[i])) + 1);
+            amount = MAXALIGN(strlen(DatumGetPointer(values[i])) + 1);
         else
-            need += MAXALIGN(VARSIZE_ANY(DatumGetPointer(values[i])));
+            amount = MAXALIGN(VARSIZE_ANY(DatumGetPointer(values[i])));
+        if (amount > MaxAllocSize - need)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pax: row size exceeds supported limits")));
+        need += amount;
     }
+
+    if (need > BLCKSZ)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pax: row is too large for one page")));
 
     return need;
 }
@@ -618,6 +751,28 @@ pax_page_free_space(Page page)
     return (Size) (phdr->pd_upper - phdr->pd_lower);
 }
 
+/* Transaction metadata ends at the first user region (or pd_lower). */
+static Size
+pax_meta_region_size(Page page, PaxPageHeader *phdr)
+{
+    PaxSpecialData *special;
+    LocationIndex start = phdr->meta_offset;
+    LocationIndex end;
+
+    Assert(PaxOffsetIsValid(start));
+
+    special = (PaxSpecialData *) PageGetSpecialPointer(page);
+    if (special->n_attrs > 0 && PaxOffsetIsValid(phdr->offsets[0]))
+        end = phdr->offsets[0];
+    else
+        end = ((PageHeader) page)->pd_lower;
+
+    if (end < start)
+        elog(ERROR, "pax: invalid transaction metadata region");
+    return (Size) (end - start);
+}
+
+
 /*
  * Insère "len" octets (doit être MAXALIGNé) à la position absolue "at" en
  * décalant tout ce qui suit vers la droite.  Les régions qui commencent à
@@ -637,6 +792,10 @@ pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
     Assert(len == MAXALIGN(len));
     Assert(at <= (Size) hdr->pd_lower);
 
+    if (hdr->pd_lower > hdr->pd_upper ||
+        len > (Size) (hdr->pd_upper - hdr->pd_lower))
+        elog(ERROR, "pax: page has no space for %zu bytes", len);
+
     if (len > 0)
         memmove((char *) page + at + len, (char *) page + at,
                 (Size) hdr->pd_lower - at);
@@ -650,6 +809,112 @@ pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
         if (PaxOffsetIsValid(phdr->offsets[j]) && phdr->offsets[j] >= at)
             phdr->offsets[j] = (OffsetNumber) (phdr->offsets[j] + len);
     }
+}
+
+static bool
+pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
+{
+    bool self_snapshot;
+
+    if (snapshot == NULL)
+        elog(ERROR, "pax: cannot test tuple visibility without a snapshot");
+
+    if (snapshot->snapshot_type == SNAPSHOT_ANY)
+        return true;
+
+    self_snapshot = snapshot->snapshot_type == SNAPSHOT_SELF;
+    if (snapshot->snapshot_type != SNAPSHOT_MVCC && !self_snapshot)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support snapshot type %d",
+                        (int) snapshot->snapshot_type)));
+
+    if (snapshot->snapshot_type == SNAPSHOT_MVCC)
+        Assert(snapshot->regd_count > 0 || snapshot->active_count > 0);
+
+    if (meta->xmin == FrozenTransactionId ||
+        meta->xmin == BootstrapTransactionId)
+    {
+        /* frozen/bootstrap inserting transaction is visible */
+    }
+    else if (TransactionIdIsCurrentTransactionId(meta->xmin))
+    {
+        if (!self_snapshot && meta->cmin >= snapshot->curcid)
+            return false;       /* inserted by the current command */
+    }
+    else if (self_snapshot)
+    {
+        if (TransactionIdIsInProgress(meta->xmin) ||
+            !TransactionIdDidCommit(meta->xmin))
+            return false;
+    }
+    else
+    {
+        if (XidInMVCCSnapshot(meta->xmin, snapshot))
+            return false;       /* inserter still in progress */
+        if (!TransactionIdDidCommit(meta->xmin))
+            return false;       /* inserter aborted */
+    }
+
+    if (!TransactionIdIsValid(meta->xmax))
+        return true;
+
+    if (TransactionIdIsCurrentTransactionId(meta->xmax))
+        return self_snapshot ? false : meta->cmax >= snapshot->curcid;
+
+    if (self_snapshot)
+    {
+        if (TransactionIdIsInProgress(meta->xmax) ||
+            !TransactionIdDidCommit(meta->xmax))
+            return true;
+        return false;
+    }
+
+    if (XidInMVCCSnapshot(meta->xmax, snapshot))
+        return true;            /* deleter still in progress */
+    if (!TransactionIdDidCommit(meta->xmax))
+        return true;            /* deleter aborted */
+
+    return false;               /* deleter committed */
+}
+
+static int
+pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc, int start)
+{
+    int tupno;
+
+    for (tupno = start; tupno < pdesc->n_tuples; tupno++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        if (pax_meta_satisfies_snapshot(&pdesc->tuple_meta[tupno],
+                                        scan->rs_base.rs_snapshot))
+            return tupno;
+    }
+
+    return -1;
+}
+
+static void
+pax_store_tuple_slot(Relation rel, TupleTableSlot *slot, Buffer buffer,
+                     PaxPageDesc *pdesc, int tupno, bool owns_pdesc)
+{
+    PaxTupleTableSlot *pslot = (PaxTupleTableSlot *) slot;
+
+    pslot->buffer = buffer;
+    IncrBufferRefCount(buffer);
+    pslot->page = BufferGetPage(buffer);
+    pslot->pdesc = pdesc;
+    pslot->tupno = tupno;
+    pslot->owns_pdesc = owns_pdesc;
+    pslot->has_tuple_meta = true;
+    pslot->tuple_meta = pdesc->tuple_meta[tupno];
+
+    slot->tts_flags &= ~TTS_FLAG_EMPTY;
+    slot->tts_nvalid = 0;
+    slot->tts_tableOid = RelationGetRelid(rel);
+    ItemPointerSet(&slot->tts_tid,
+                   BufferGetBlockNumber(buffer),
+                   (OffsetNumber) (tupno + 1));
 }
 
 /* ------------------------------------------------------------------ */
@@ -674,6 +939,9 @@ pax_slot_init(TupleTableSlot *base)
     slot->page   = NULL;
     slot->pdesc  = NULL;
     slot->tupno  = -1;
+    slot->owns_pdesc = false;
+    slot->has_tuple_meta = false;
+    memset(&slot->tuple_meta, 0, sizeof(slot->tuple_meta));
 }
 
 /* Pas de ressource à libérer au-delà de clear(). */
@@ -723,23 +991,44 @@ pax_slot_getsomeattrs(TupleTableSlot *base, int natts)
 static Datum
 pax_slot_getsysattr(TupleTableSlot *base, int attnum, bool *isnull)
 {
-    /* Les colonnes système (xmin, ctid, …) ne sont pas gérées pour l'instant. */
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("pax table AM does not support system column %d", attnum)));
-    *isnull = true;                 /* pas atteint */
-    return (Datum) 0;
+    PaxTupleTableSlot *slot = (PaxTupleTableSlot *) base;
+
+    if (!slot->has_tuple_meta)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pax tuple slot has no transaction metadata")));
+
+    *isnull = false;
+    switch (attnum)
+    {
+        case MinTransactionIdAttributeNumber:
+            return TransactionIdGetDatum(slot->tuple_meta.xmin);
+        case MinCommandIdAttributeNumber:
+            return CommandIdGetDatum(slot->tuple_meta.cmin);
+        case MaxTransactionIdAttributeNumber:
+            return TransactionIdGetDatum(slot->tuple_meta.xmax);
+        case MaxCommandIdAttributeNumber:
+            /* Heap exposes the raw shared command field when xmax is absent. */
+            return CommandIdGetDatum(TransactionIdIsValid(slot->tuple_meta.xmax) ?
+                                     slot->tuple_meta.cmax :
+                                     slot->tuple_meta.cmin);
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("pax table AM does not support system column %d",
+                            attnum)));
+            return (Datum) 0;       /* keep compiler quiet */
+    }
 }
 
-/*
- * Pas de MVCC encore : on ne sait pas si une ligne vient de la transaction
- * courante. On répond « non », ce qui pousse les déclencheurs RI à vérifier
- * l'existence de la ligne comme pour une ligne ancienne.
- */
 static bool
 pax_slot_is_current_xact_tuple(TupleTableSlot *base)
 {
-    return false;
+    PaxTupleTableSlot *slot = (PaxTupleTableSlot *) base;
+
+    return slot->has_tuple_meta &&
+        slot->tuple_meta.xmin != FrozenTransactionId &&
+        TransactionIdIsCurrentTransactionId(slot->tuple_meta.xmin);
 }
 
 static void
@@ -769,6 +1058,9 @@ pax_slot_clear(TupleTableSlot *base)
         base->tts_flags &= ~TTS_FLAG_SHOULDFREE;
     }
 
+    if (slot->owns_pdesc && slot->pdesc != NULL)
+        pax_free_page_desc(slot->pdesc);
+
     if (BufferIsValid(slot->buffer))
     {
         ReleaseBuffer(slot->buffer);
@@ -776,13 +1068,15 @@ pax_slot_clear(TupleTableSlot *base)
     }
 
     /*
-     * Le descripteur de page appartient au scan (libéré à la page suivante,
-     * au scan_end ou au rescan) : le slot ne fait que l'emprunter et ne doit
-     * surtout pas le libérer — sinon double free / use-after-free.
+     * A scan owns its descriptor and the slot only borrows it.  A descriptor
+     * obtained by tuple_fetch_row_version(), however, is owned by the slot.
      */
     slot->page   = NULL;
     slot->pdesc  = NULL;
     slot->tupno  = -1;
+    slot->owns_pdesc = false;
+    slot->has_tuple_meta = false;
+    memset(&slot->tuple_meta, 0, sizeof(slot->tuple_meta));
 
     base->tts_flags |= TTS_FLAG_EMPTY;
     base->tts_nvalid = 0;
@@ -823,6 +1117,9 @@ pax_slot_materialize(TupleTableSlot *base)
 
     base->tts_flags |= TTS_FLAG_SHOULDFREE;
 
+    if (slot->owns_pdesc && slot->pdesc != NULL)
+        pax_free_page_desc(slot->pdesc);
+
     /* la ligne ne dépend plus de la page : on peut rendre le pin */
     if (BufferIsValid(slot->buffer))
     {
@@ -832,12 +1129,16 @@ pax_slot_materialize(TupleTableSlot *base)
     slot->page   = NULL;
     slot->pdesc  = NULL;
     slot->tupno  = -1;
+    slot->owns_pdesc = false;
+    /* has_tuple_meta and tuple_meta deliberately survive materialization */
 }
 
 static void
 pax_slot_copyslot(TupleTableSlot *dstbase, TupleTableSlot *srcbase)
 {
     TupleDesc   desc = srcbase->tts_tupleDescriptor;
+    PaxTupleTableSlot *dstslot = (PaxTupleTableSlot *) dstbase;
+    PaxTupleTableSlot *srcslot = (PaxTupleTableSlot *) srcbase;
     int         i;
 
     ExecClearTuple(dstbase);        /* libère pin + copies éventuelles */
@@ -854,6 +1155,11 @@ pax_slot_copyslot(TupleTableSlot *dstbase, TupleTableSlot *srcbase)
     dstbase->tts_nvalid = desc->natts;
     dstbase->tts_tid     = srcbase->tts_tid;
     dstbase->tts_tableOid = srcbase->tts_tableOid;
+    if (srcbase->tts_ops == &TTSOpsPax)
+    {
+        dstslot->has_tuple_meta = srcslot->has_tuple_meta;
+        dstslot->tuple_meta = srcslot->tuple_meta;
+    }
 
     pax_slot_materialize(dstbase);  /* détache de la page source */
 }
@@ -909,19 +1215,34 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
 {
     PaxScanDesc scan;
 
-    scan = (PaxScanDesc) palloc0(sizeof(PaxScanDescData));
+    if (pscan != NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support parallel table scans")));
 
+    RelationIncrementReferenceCount(rel);
+
+    scan = (PaxScanDesc) palloc0(sizeof(PaxScanDescData));
     scan->rs_base.rs_rd        = rel;
     scan->rs_base.rs_snapshot  = snapshot;
     scan->rs_base.rs_nkeys     = nkeys;
-    scan->rs_base.rs_key       = key;
     scan->rs_base.rs_flags     = flags;
-    /* scan->rs_base.rs_parallel = pscan; */
+    if (nkeys > 0 && key != NULL)
+    {
+        scan->rs_base.rs_key = palloc_array(ScanKeyData, nkeys);
+        memcpy(scan->rs_base.rs_key, key, sizeof(ScanKeyData) * nkeys);
+    }
+    else
+        scan->rs_base.rs_key = NULL;
 
     scan->current_buf    = InvalidBuffer;
     scan->current_pdesc  = NULL;
     scan->current_tupno  = -1;
     scan->current_block  = 0;
+    scan->nblocks        = RelationGetNumberOfBlocks(rel);
+
+    if (flags & SO_TYPE_SEQSCAN)
+        PredicateLockRelation(rel, snapshot);
 
     return (TableScanDesc) scan;
 }
@@ -943,6 +1264,10 @@ pax_scan_end(TableScanDesc sscan)
         scan->current_pdesc = NULL;
     }
 
+    if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
+        UnregisterSnapshot(scan->rs_base.rs_snapshot);
+
+    RelationDecrementReferenceCount(scan->rs_base.rs_rd);
     pfree(scan);
 }
 
@@ -967,73 +1292,59 @@ pax_scan_rescan(TableScanDesc sscan, ScanKey key,
 
     scan->current_tupno = -1;
     scan->current_block = 0;
+    scan->nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
 
+    if (scan->rs_base.rs_key)
+        pfree(scan->rs_base.rs_key);
     if (key && scan->rs_base.rs_nkeys > 0)
-        scan->rs_base.rs_key = key;
+    {
+        scan->rs_base.rs_key = palloc_array(ScanKeyData,
+                                            scan->rs_base.rs_nkeys);
+        memcpy(scan->rs_base.rs_key, key,
+               sizeof(ScanKeyData) * scan->rs_base.rs_nkeys);
+    }
+    else
+        scan->rs_base.rs_key = NULL;
 }
 
 static bool
 pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
                      TupleTableSlot *slot)
 {
-    PaxScanDesc         scan = (PaxScanDesc) sscan;
-    PaxTupleTableSlot  *pslot;
-    Relation            rel = scan->rs_base.rs_rd;
-    TupleDesc           tupdesc = RelationGetDescr(rel);
-    BlockNumber         nblocks;
-    Buffer              buf;
-    Page                page;
-    PaxPageDesc        *pdesc;
-    int                 tupno;
+    PaxScanDesc  scan = (PaxScanDesc) sscan;
+    Relation     rel = scan->rs_base.rs_rd;
+    TupleDesc    tupdesc = RelationGetDescr(rel);
+    Buffer       buf;
+    Page         page;
+    PaxPageDesc *pdesc;
+    int          tupno;
 
-    /* On s'attend à recevoir notre propre type de slot */
-    pslot = (PaxTupleTableSlot *) slot;
-
-    /*
-     * Libère le contenu précédent : on ne fait que pointer dans la page,
-     * le descripteur appartient au scan. ExecClearTuple → pax_slot_clear.
-     */
+    /* The previous slot may borrow scan->current_pdesc, so clear it first. */
     ExecClearTuple(slot);
 
-    /* === Continuer sur la page courante === */
     if (BufferIsValid(scan->current_buf))
     {
         pdesc = scan->current_pdesc;
-        tupno = scan->current_tupno + 1;
-
-        if (tupno < pdesc->n_tuples)
+        tupno = pax_find_visible_tuple(scan, pdesc,
+                                       scan->current_tupno + 1);
+        if (tupno >= 0)
         {
             scan->current_tupno = tupno;
-
-            pslot->buffer = scan->current_buf;
-            IncrBufferRefCount(scan->current_buf);
-            pslot->page   = BufferGetPage(scan->current_buf);
-            pslot->pdesc  = pdesc;          /* emprunté, libéré par le scan */
-            pslot->tupno  = tupno;
-
-            /* pas ExecStoreVirtualTuple : cela poserait tts_nvalid = natts
-             * et tuerait la déformation paresseuse de getsomeattrs */
-            slot->tts_flags &= ~TTS_FLAG_EMPTY;
-            slot->tts_nvalid = 0;
-            /* offset de TID = tupno + 1 (les offsets de TID débutent à 1) */
-            ItemPointerSet(&slot->tts_tid,
-                           BufferGetBlockNumber(scan->current_buf),
-                           (OffsetNumber) (tupno + 1));
+            pax_store_tuple_slot(rel, slot, scan->current_buf, pdesc,
+                                 tupno, false);
             return true;
         }
 
-        /* Page terminée */
         ReleaseBuffer(scan->current_buf);
         scan->current_buf = InvalidBuffer;
         pax_free_page_desc(scan->current_pdesc);
         scan->current_pdesc = NULL;
     }
 
-    /* === Chercher la page suivante non vide === */
-    nblocks = RelationGetNumberOfBlocks(rel);
-
-    while (scan->current_block < nblocks)
+    while (scan->current_block < scan->nblocks)
     {
+        CHECK_FOR_INTERRUPTS();
+
         buf = ReadBuffer(rel, scan->current_block);
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buf);
@@ -1041,38 +1352,27 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
         if (!pax_page_is_valid(page))
         {
             UnlockReleaseBuffer(buf);
-            scan->current_block++;
-            continue;
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 scan->current_block, RelationGetRelationName(rel));
         }
 
         pdesc = pax_build_page_desc(page, tupdesc);
+        tupno = pax_find_visible_tuple(scan, pdesc, 0);
 
         /*
-         * On ne garde PAS le content lock entre deux appels de
-         * scan_getnextslot : le verrou resterait posé jusqu'au scan_end et
-         * une écriture concurrente finirait par deadlock. On ne conserve que
-         * le pin, suffisant pour que pdesc->... reste adressable.
-         * (Concurrence réduite : notre insert écrit toujours une page neuve.)
+         * The descriptor's transaction metadata is copied, but user values
+         * still borrow the page.  Keep the existing pin-based lazy design for
+         * now; the remaining concurrent page-move race is tracked separately.
          */
         UnlockBuffer(buf);
 
-        if (pdesc->n_tuples > 0)
+        if (tupno >= 0)
         {
-            scan->current_buf   = buf;
+            scan->current_buf = buf;
             scan->current_pdesc = pdesc;
-            scan->current_tupno = 0;
+            scan->current_tupno = tupno;
             scan->current_block++;
-
-            pslot->buffer = buf;
-            IncrBufferRefCount(buf);
-            pslot->page   = page;
-            pslot->pdesc  = pdesc;          /* emprunté, libéré par le scan */
-            pslot->tupno  = 0;
-
-            slot->tts_flags &= ~TTS_FLAG_EMPTY;
-            slot->tts_nvalid = 0;
-            ItemPointerSet(&slot->tts_tid, BufferGetBlockNumber(buf),
-                           (OffsetNumber) 1);  /* tupno 0 → offset de TID 1 */
+            pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
             return true;
         }
 
@@ -1092,12 +1392,13 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
  * Insertion réelle :
  * - choisit la première page ayant assez de place (sinon en crée une),
  * - écrit les valeurs variables en haut de page (pd_upper descendante),
+ * - stocke xmin/cmin dans la région de métadonnées,
  * - fait grandir la région de chaque colonne ([bitmap][valeurs]) via des
  *   memmove vers la droite (pd_lower montante),
  * - pose le bit de NULL dans le bitmap de chaque colonne.
  *
- * Reste à faire (voir analysis0.md) : MVCC (xmin/xmax), Generic WAL,
- * gestion FSM au lieu d'un premier libre naïf.
+ * Reste à faire : Generic WAL, gestion FSM, versions UPDATE/DELETE et
+ * vacuum.
  */
 #if PG_VERSION_NUM >= 190000
 static void
@@ -1125,6 +1426,19 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     Datum          *values;
     bool           *isnulls;
     OffsetNumber   *voffs;
+    TransactionId   xmin;
+    PaxTupleMetaData *meta;
+    Size             needed;
+    Size             available;
+    Size             meta_at;
+    Size             meta_size;
+
+    if (IsParallelWorker())
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pax table AM does not support parallel inserts")));
+    if (cid == InvalidCommandId)
+        elog(ERROR, "pax: invalid insert command ID");
 
     /*
      * Détache la ligne du slot d'origine : pour INSERT ... SELECT la source
@@ -1150,30 +1464,52 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
             values[i] = PointerGetDatum(PG_DETOAST_DATUM(values[i]));
     }
 
+    /*
+     * Store the current subtransaction XID, not the top-level XID.  A rollback
+     * to a savepoint must therefore make this physical row permanently
+     * invisible even if the outer transaction eventually commits.
+     */
+    xmin = GetCurrentTransactionId();
+    if (options & TABLE_INSERT_FROZEN)
+        xmin = FrozenTransactionId;
+
+    /* Coarse relation-level SSI check; PAX currently has only sequential scans. */
+    CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
+
     /* === 1. Choisir une page ayant assez de place (premier libre) === */
     nblocks = RelationGetNumberOfBlocks(rel);
 
     for (blk = 0; blk < nblocks; blk++)
     {
-        Buffer          b = ReadBuffer(rel, blk);
+        Buffer          b;
         Page            p;
+        PaxSpecialData *special;
         PaxPageHeader  *h;
-        Size            needed;
+
+        CHECK_FOR_INTERRUPTS();
+        b = ReadBuffer(rel, blk);
 
         LockBuffer(b, BUFFER_LOCK_EXCLUSIVE);
         p = BufferGetPage(b);
 
         if (!pax_page_is_valid(p))
         {
-            /* Page jamais initialisée (extension au zéro) : on l'initie ;
-             * page d'un format étranger : on la saute. */
             if (PageIsNew(p))
                 pax_page_init(p, natts);
             else
             {
                 UnlockReleaseBuffer(b);
-                continue;
+                elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                     blk, RelationGetRelationName(rel));
             }
+        }
+
+        special = (PaxSpecialData *) PageGetSpecialPointer(p);
+        if (special->n_attrs != natts)
+        {
+            UnlockReleaseBuffer(b);
+            elog(ERROR, "pax: attribute count mismatch (page %u vs tupdesc %d)",
+                 special->n_attrs, natts);
         }
 
         /* n_tuples lu APRÈS le lock : l'état peut avoir changé */
@@ -1193,13 +1529,34 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     {
         buf = ReadBuffer(rel, P_NEW);
         LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-        pax_page_init(BufferGetPage(buf), natts);
+        page = BufferGetPage(buf);
+        pax_page_init(page, natts);
+        needed = pax_insert_space_needed(rel, values, isnulls, 0);
+        available = pax_page_free_space(page);
+        if (available < needed)
+        {
+            UnlockReleaseBuffer(buf);
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pax: row is too large for one page"),
+                     errdetail("The row needs %zu bytes but a new PAX page has only %zu bytes.",
+                               needed, available)));
+        }
     }
 
     page  = BufferGetPage(buf);
     pghdr = (PageHeader) page;
     phdr  = PaxPageHeaderPtr(page);
     tupno = phdr->n_tuples;
+
+    if (tupno >= MaxOffsetNumber)
+    {
+        UnlockReleaseBuffer(buf);
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pax: too many tuples on page %u",
+                        BufferGetBlockNumber(buf))));
+    }
 
     /* === 2. Valeurs variables : en haut de page, avant tout décalage === */
     for (i = 0; i < natts; i++)
@@ -1217,7 +1574,25 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
                  pghdr->pd_lower, pghdr->pd_upper, phdr->n_tuples);
     }
 
-    /* === 3. Une région par colonne : [bitmap de NULL][valeurs] === */
+    /* === 3. Transaction metadata: one fixed record per tuple === */
+    if (!PaxOffsetIsValid(phdr->meta_offset))
+        elog(ERROR, "pax: missing transaction metadata region");
+    meta_size = pax_meta_region_size(page, phdr);
+    if (meta_size != (Size) tupno * SizeOfPaxTupleMetaData)
+        elog(ERROR, "pax: inconsistent transaction metadata region");
+
+    meta_at = (Size) phdr->meta_offset +
+        (Size) tupno * SizeOfPaxTupleMetaData;
+    pax_insert_bytes(page, phdr, natts, PAX_NO_REGION, meta_at,
+                     SizeOfPaxTupleMetaData);
+    meta = ((PaxTupleMetaData *) ((char *) page + phdr->meta_offset)) + tupno;
+    memset(meta, 0, SizeOfPaxTupleMetaData);
+    meta->xmin = xmin;
+    meta->xmax = InvalidTransactionId;
+    meta->cmin = cid;
+    meta->cmax = InvalidCommandId;
+
+    /* === 4. Une région par colonne : [bitmap de NULL][valeurs] === */
     for (i = 0; i < natts; i++)
     {
         Form_pg_attribute attr   = TupleDescAttr(tupdesc, i);
@@ -1240,7 +1615,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         cur = rsize - (Size) tupno * stride;     /* = bitmap seul */
 
         /* 3a) le bitmap doit couvrir le bit "tupno" (0 = NULL, 1 = valeur) */
-        want = MAXALIGN(((Size) tupno + 8) / 8);
+        want = pax_bitmap_size(tupno + 1);
         if (want > cur)
         {
             at = region_start + cur;
@@ -1301,13 +1676,21 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
             ((OffsetNumber *) ((char *) page + at))[0] = voffs[i];
     }
 
-    /* === 4. Finaliser === */
+    /* === 5. Finaliser === */
     phdr->n_tuples++;
     phdr->free_space = (uint16) pax_page_free_space(page);
 
     /* TID : offset de TID = tupno + 1 (les offsets de TID débutent à 1) */
     ItemPointerSet(&(slot->tts_tid), BufferGetBlockNumber(buf),
                    (OffsetNumber) (tupno + 1));
+    slot->tts_tableOid = RelationGetRelid(rel);
+    if (slot->tts_ops == &TTSOpsPax)
+    {
+        PaxTupleTableSlot *pslot = (PaxTupleTableSlot *) slot;
+
+        pslot->has_tuple_meta = true;
+        pslot->tuple_meta = *meta;
+    }
 
     /* TODO: Generic WAL */
 
@@ -1317,6 +1700,93 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     pfree(values);
     pfree(isnulls);
     pfree(voffs);
+}
+
+/* ------------------------------------------------------------------ */
+/* Tuple lookup / MVCC callbacks                                       */
+/* ------------------------------------------------------------------ */
+
+static bool
+pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
+                            Snapshot snapshot, TupleTableSlot *slot)
+{
+    BlockNumber  blkno;
+    OffsetNumber offset;
+    int          tupno;
+    Buffer       buf;
+    Page         page;
+    PaxPageDesc *pdesc;
+    bool         visible;
+
+    ExecClearTuple(slot);
+
+    if (!ItemPointerIsValid(tid))
+        return false;
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offset = ItemPointerGetOffsetNumber(tid);
+    if (!OffsetNumberIsValid(offset) ||
+        blkno >= RelationGetNumberOfBlocks(rel))
+        return false;
+
+    buf = ReadBuffer(rel, blkno);
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+
+    if (!pax_page_is_valid(page))
+    {
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+             blkno, RelationGetRelationName(rel));
+    }
+
+    pdesc = pax_build_page_desc(page, RelationGetDescr(rel));
+    tupno = (int) offset - 1;
+    visible = tupno < pdesc->n_tuples &&
+        pax_meta_satisfies_snapshot(&pdesc->tuple_meta[tupno], snapshot);
+
+    if (visible)
+        pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, true);
+    else
+        pax_free_page_desc(pdesc);
+
+    UnlockReleaseBuffer(buf);
+    return visible;
+}
+
+static bool
+pax_tuple_tid_valid(TableScanDesc sscan, ItemPointer tid)
+{
+    PaxScanDesc scan = (PaxScanDesc) sscan;
+    OffsetNumber offset;
+
+    if (!ItemPointerIsValid(tid))
+        return false;
+
+    offset = ItemPointerGetOffsetNumber(tid);
+    return OffsetNumberIsValid(offset) &&
+        ItemPointerGetBlockNumber(tid) < scan->nblocks;
+}
+
+static void
+pax_tuple_get_latest_tid(TableScanDesc sscan, ItemPointer tid)
+{
+    if (!pax_tuple_tid_valid(sscan, tid))
+        elog(ERROR, "pax: invalid tuple identifier");
+    /* PAX has no update-version chain yet, so this TID is already latest. */
+}
+
+static bool
+pax_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
+                              Snapshot snapshot)
+{
+    PaxTupleTableSlot *pslot = (PaxTupleTableSlot *) slot;
+
+    (void) rel;
+    if (!pslot->has_tuple_meta)
+        elog(ERROR, "pax tuple slot has no transaction metadata");
+
+    return pax_meta_satisfies_snapshot(&pslot->tuple_meta, snapshot);
 }
 
 /* ------------------------------------------------------------------ */
