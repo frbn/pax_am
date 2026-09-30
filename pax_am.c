@@ -15,7 +15,8 @@
  *     page, régions de colonnes qui grandissent, bitmap de NULL par colonne
  *
  * Limitations :
- *   - pas de FSM réel (recherche first-fit linéaire sur les pages)
+ *   - FSM utilisé pour le choix de page à l'insertion, mais jamais mis à jour
+ *     par un VACUUM (inexistant) : l'espace libre ne fait que décroître
  *   - versions UPDATE / DELETE append-only, sans VACUUM ni gel des tuples
  *   - Generic WAL couvre les mutations de page ; l'insertion spéculative reste
  *     non supportée
@@ -45,6 +46,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/freespace.h"
 #include "storage/itemptr.h"
 #include "storage/lmgr.h"
 #include "storage/off.h"
@@ -188,6 +190,20 @@ typedef struct PaxPageDesc
     int             n_attrs;
     int             n_tuples;
     MemoryContext   ctx;        /* contexte dans lequel le desc a été alloué */
+
+    /*
+     * Instantané de la mise en page, utilisé par pax_layout_is_current().
+     *
+     * header et special pointent DANS la page : les comparer à eux-mêmes ne
+     * prouverait rien. Il faut une copie indépendante des champs qui
+     * déterminent la géométrie des régions, pour pouvoir vérifier que le
+     * cache décrit toujours la page courante.
+     */
+    BlockNumber     stamp_blkno;
+    uint16          stamp_flags;
+    OffsetNumber    stamp_meta_offset;
+    OffsetNumber   *stamp_offsets;    /* n_attrs entrées */
+    int             meta_capacity;    /* versions que tuple_meta peut contenir */
 } PaxPageDesc;
 
 /* ------------------------------------------------------------------ */
@@ -237,6 +253,16 @@ typedef struct PaxScanDescData
      * that needs to modify a tuple on this very block.
      */
     Buffer          current_buf;
+
+    /*
+     * Mise en page de la page courante, conservée d'une tupline à l'autre et
+     * revalidée à chaque appel (pax_layout_is_current). Les métadonnées de
+     * version ne sont pas mises en cache : elles sont recopiées à chaque
+     * appel. Le contexte survit au scan entier ; le descripteur est
+     * reconstruit dès que l'en-tête de page change.
+     */
+    PaxPageDesc    *cached_desc;
+    MemoryContext   desc_ctx;
 } PaxScanDescData;
 
 typedef PaxScanDescData *PaxScanDesc;
@@ -248,6 +274,13 @@ typedef PaxScanDescData *PaxScanDesc;
 /* Page mngmt */
 static void         pax_page_init(Page page, int n_attrs);
 static bool         pax_page_is_valid(Page page);
+static PaxPageDesc *pax_build_page_layout(Page page, BlockNumber blkno,
+                                           TupleDesc tupdesc);
+static bool         pax_layout_is_current(const PaxPageDesc *desc, Page page,
+                                           BlockNumber blkno,
+                                           PaxPageHeader *phdr,
+                                           TupleDesc tupdesc);
+static void         pax_refresh_tuple_meta(PaxPageDesc *desc, Page page);
 static PaxPageDesc *pax_build_page_desc(Page page, TupleDesc tupdesc);
 static void         pax_free_page_desc(PaxPageDesc *desc);
 
@@ -258,6 +291,8 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 static Size         pax_slot_stride(Form_pg_attribute attr);
 static Size         pax_region_used(int n_tuples, Size stride);
 static Size         pax_bitmap_size(int n_tuples);
+static Size         pax_insert_space_hint(Relation rel, Datum *values,
+                                          bool *isnulls);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
                                             bool *isnulls, int tupno,
                                             PaxPageHeader *phdr);
@@ -315,6 +350,9 @@ static bool         pax_scan_getnextslot_tidrange(TableScanDesc sscan,
                                                   TupleTableSlot *slot);
 static void         pax_scan_unpin_current(PaxScanDesc scan);
 static Buffer       pax_scan_lock_current_page(PaxScanDesc scan, Relation rel);
+static PaxPageDesc *pax_scan_page_desc(PaxScanDesc scan, Page page,
+                                        BlockNumber blkno, TupleDesc tupdesc);
+static void         pax_scan_drop_cached_desc(PaxScanDesc scan);
 
 /* Tuple lookup / visibility */
 static bool         pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
@@ -780,12 +818,20 @@ pax_page_is_valid(Page page)
 }
 
 /*
- * Construit un PaxPageDesc à partir d'une page.
- * Les métadonnées de colonnes (attlen, attalign, is_varlena) sont
- * récupérées depuis le TupleDesc.
+ * Construit la partie « mise en page » d'un PaxPageDesc : géométrie des
+ * régions, pas des slots, pointeurs vers les bitmap et les valeurs.
+ *
+ * Cette partie ne dépend QUE de l'en-tête de page. Elle reste donc valable
+ * d'une tupline à l'autre tant que n_tuples, meta_offset, flags et offsets[]
+ * ne changent pas : c'est ce que permet de la mettre en cache
+ * (pax_layout_is_current).
+ *
+ * Les métadonnées de version, elles, sont relues à chaque appel par
+ * pax_refresh_tuple_meta() car elles changent au fil des UPDATE et DELETE
+ * concurrents.
  */
 static PaxPageDesc *
-pax_build_page_desc(Page page, TupleDesc tupdesc)
+pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
 {
     PaxPageDesc    *desc;
     PaxSpecialData *special;
@@ -822,51 +868,14 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
         (phdr->flags & PAX_FLAG_HAS_VERSIONS) == 0)
         elog(ERROR, "pax: page header lacks required transaction/version metadata");
 
-    if (desc->n_tuples > 0)
-    {
-        Size expected = (Size) desc->n_tuples * SizeOfPaxTupleMetaData;
-        Size actual;
-
-        if (!PaxOffsetIsValid(phdr->meta_offset))
-            elog(ERROR, "pax: missing transaction metadata region");
-
-        actual = pax_meta_region_size(page, phdr);
-        if (actual != expected)
-            elog(ERROR, "pax: inconsistent transaction metadata region "
-                        "(region %zu, %d tuples x %zu)",
-                 actual, desc->n_tuples, SizeOfPaxTupleMetaData);
-
-        desc->tuple_meta = (PaxTupleMetaData *)
-            palloc(sizeof(PaxTupleMetaData) * desc->n_tuples);
-        memcpy(desc->tuple_meta,
-               (char *) page + phdr->meta_offset,
-               expected);
-
-        for (i = 0; i < desc->n_tuples; i++)
-        {
-            PaxTupleMetaData *meta = &desc->tuple_meta[i];
-
-            if (!TransactionIdIsValid(meta->xmin))
-                elog(ERROR, "pax: tuple %d has invalid xmin", i);
-            if (meta->cmin == InvalidCommandId)
-                elog(ERROR, "pax: tuple %d has invalid cmin", i);
-            if (!TransactionIdIsValid(meta->xmax) &&
-                meta->cmax != InvalidCommandId)
-                elog(ERROR, "pax: tuple %d has cmax without xmax", i);
-            if (TransactionIdIsValid(meta->xmax) &&
-                meta->cmax == InvalidCommandId)
-                elog(ERROR, "pax: tuple %d has xmax without cmax", i);
-            if (!ItemPointerIsValid(&meta->t_ctid) ||
-                !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
-                elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
-            if (meta->flags != 0)
-                elog(ERROR, "pax: tuple %d has unknown metadata flags %#x",
-                     i, meta->flags);
-            if (meta->reserved2 != 0)
-                elog(ERROR, "pax: tuple %d has nonzero metadata padding",
-                     i);
-        }
-    }
+    /* Instantané indépendant, pour la revalidation (voir PaxPageDesc). */
+    desc->stamp_blkno      = blkno;
+    desc->stamp_flags      = phdr->flags;
+    desc->stamp_meta_offset = phdr->meta_offset;
+    desc->stamp_offsets    = (OffsetNumber *)
+        palloc(sizeof(OffsetNumber) * desc->n_attrs);
+    memcpy(desc->stamp_offsets, phdr->offsets,
+           sizeof(OffsetNumber) * desc->n_attrs);
 
     desc->minipages = (PaxMinipage *) palloc0(sizeof(PaxMinipage) * desc->n_attrs);
 
@@ -937,6 +946,145 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
     return desc;
 }
 
+/*
+ * Vrai si la mise en page en cache décrit encore la page courante.
+ *
+ * On compare l'instantané (copie indépendante) à l'en-tête relu : c'est la
+ * seule façon de détecter une modification, puisque desc->header pointe dans
+ * la page et ne fournirait aucune référence antérieure.
+ */
+static bool
+pax_layout_is_current(const PaxPageDesc *desc, Page page, BlockNumber blkno,
+                      PaxPageHeader *phdr, TupleDesc tupdesc)
+{
+    int i;
+
+    if (desc == NULL || desc->page != page)
+        return false;
+
+    /* Le buffer épinglé garantit qu'il s'agit bien du même bloc. */
+    if (desc->stamp_blkno != blkno)
+        return false;
+
+    /* Un changement de tupline est le seul cas normal de réutilisation. */
+    if (desc->n_tuples != phdr->n_tuples)
+        return false;
+
+    if (desc->stamp_flags != phdr->flags ||
+        desc->stamp_meta_offset != phdr->meta_offset)
+        return false;
+
+    if (desc->n_attrs != tupdesc->natts)
+        return false;
+
+    /*
+     * offsets[] : une insertion concurrente décale les régions en memmove,
+     * donc toute modification invalide les pointeurs mis en cache.
+     */
+    for (i = 0; i < desc->n_attrs; i++)
+    {
+        if (desc->stamp_offsets[i] != phdr->offsets[i])
+            return false;
+    }
+
+    return true;
+}
+
+/*
+ * Relit et revalide les métadonnées de version dans un descripteur dont la
+ * mise en page est déjà valide.
+ *
+ * xmin, xmax, cmin, cmax, t_ctid et locker_mxid sont modifiés en place par les
+ * UPDATE, DELETE etdéverrouillages concurrents : ils ne sont jamais mis en
+ * cache, seulement recopiés. La revalidation complète est conservée : c'est
+ * elle qui transforme une page corrompue en erreur franche plutôt qu'en
+ * décision de visibilité erronée.
+ */
+static void
+pax_refresh_tuple_meta(PaxPageDesc *desc, Page page)
+{
+    PaxPageHeader  *phdr = desc->header;
+    Size            expected;
+    int             i;
+
+    desc->n_tuples = phdr->n_tuples;
+
+    for (i = 0; i < desc->n_attrs; i++)
+        desc->minipages[i].n_values = desc->n_tuples;
+
+    if (desc->n_tuples == 0)
+        return;
+
+    expected = (Size) desc->n_tuples * SizeOfPaxTupleMetaData;
+
+    if (!PaxOffsetIsValid(phdr->meta_offset))
+        elog(ERROR, "pax: missing transaction metadata region");
+
+    if (pax_meta_region_size(page, phdr) != expected)
+        elog(ERROR, "pax: inconsistent transaction metadata region "
+                    "(region %zu, %d tuples x %zu)",
+             pax_meta_region_size(page, phdr), desc->n_tuples,
+             SizeOfPaxTupleMetaData);
+
+    /*
+     * Réallocation seulement si la page a gagné des versions depuis le
+     * dernier rafraîchissement. C'est le seul cas qui écrit dans ce tampon.
+     */
+    if (desc->tuple_meta == NULL || desc->n_tuples > desc->meta_capacity)
+    {
+        if (desc->tuple_meta)
+            pfree(desc->tuple_meta);
+        desc->tuple_meta = (PaxTupleMetaData *)
+            palloc(SizeOfPaxTupleMetaData * desc->n_tuples);
+        desc->meta_capacity = desc->n_tuples;
+    }
+
+    memcpy(desc->tuple_meta,
+           (char *) page + phdr->meta_offset,
+           expected);
+
+    for (i = 0; i < desc->n_tuples; i++)
+    {
+        PaxTupleMetaData *meta = &desc->tuple_meta[i];
+
+        if (!TransactionIdIsValid(meta->xmin))
+            elog(ERROR, "pax: tuple %d has invalid xmin", i);
+        if (meta->cmin == InvalidCommandId)
+            elog(ERROR, "pax: tuple %d has invalid cmin", i);
+        if (!TransactionIdIsValid(meta->xmax) &&
+            meta->cmax != InvalidCommandId)
+            elog(ERROR, "pax: tuple %d has cmax without xmax", i);
+        if (TransactionIdIsValid(meta->xmax) &&
+            meta->cmax == InvalidCommandId)
+            elog(ERROR, "pax: tuple %d has xmax without cmax", i);
+        if (!ItemPointerIsValid(&meta->t_ctid) ||
+            !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
+            elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
+        if (meta->flags != 0)
+            elog(ERROR, "pax: tuple %d has unknown metadata flags %#x",
+                 i, meta->flags);
+        if (meta->reserved2 != 0)
+            elog(ERROR, "pax: tuple %d has nonzero metadata padding", i);
+    }
+}
+
+/*
+ * Construit un descripteur complet (mise en page + métadonnées). Utilisé par
+ * les chemins qui ne balayent pas de façon répétée : UPDATE, DELETE,
+ * verrouillage, lecture directe d'un TID.
+ */
+static PaxPageDesc *
+pax_build_page_desc(Page page, TupleDesc tupdesc)
+{
+    PaxPageDesc *desc;
+
+    desc = pax_build_page_layout(page, InvalidBlockNumber, tupdesc);
+
+    pax_refresh_tuple_meta(desc, page);
+
+    return desc;
+}
+
 static void
 pax_free_page_desc(PaxPageDesc *desc)
 {
@@ -947,6 +1095,8 @@ pax_free_page_desc(PaxPageDesc *desc)
         pfree(desc->tuple_meta);
     if (desc->minipages)
         pfree(desc->minipages);
+    if (desc->stamp_offsets)
+        pfree(desc->stamp_offsets);
     pfree(desc);
 }
 
@@ -1095,12 +1245,49 @@ pax_bitmap_size(int n_tuples)
 }
 
 /*
+ * Borne inférieure de l'espace requis pour une insertion, servant à
+ * interroger le FSM avant de connaître l'état de la page.
+ *
+ * On prend deliberately le delta de bitmap à zéro, c'est-à-dire le coût d'un
+ * ajout sur une page déjà bien remplie : la valeur est donc une borne
+ * inférieure, jamais une surestimation. Le FSM propose ainsi au moins tous
+ * les candidats réellement utilisables, et la place exacte est revérifiée sous
+ * verrou exclusif avant d'écrire.
+ */
+static Size
+pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
+{
+    TupleDesc   tupdesc = RelationGetDescr(rel);
+    Size        need = SizeOfPaxTupleMetaData;
+    Size        amount;
+    int         i;
+
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+        need += pax_slot_stride(attr);
+
+        if (isnulls[i] || attr->attlen >= 0)
+            continue;
+
+        if (attr->attlen == -2)
+            amount = MAXALIGN(strlen(DatumGetPointer(values[i])) + 1);
+        else
+            amount = MAXALIGN(VARSIZE_ANY(DatumGetPointer(values[i])));
+        need += amount;
+    }
+
+    return need;
+}
+
+/*
  * Espace (borne supérieure) exigé pour insérer ce tuple dans une page qui
  * contient déjà "tupno" tuples.
  *
- * "phdr" permet de ne provisionner le bourrage d'alignement que pour les
- * colonnes réellement absentes de la page ; passer NULL revient à supposer
- * qu'aucune région n'existe encore (page neuve).
+ * "phdr" permet de ne provisionner que ce qui concerne les colonnes
+ * réellement absentes de la page ; passer NULL revient à supposer qu'aucune
+ * région n'existe encore (page neuve).
  */
 static Size
 pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls,
@@ -1705,6 +1892,10 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
     scan->current_block  = 0;
     scan->nblocks        = RelationGetNumberOfBlocks(rel);
     scan->current_buf    = InvalidBuffer;
+    scan->cached_desc    = NULL;
+    scan->desc_ctx       = AllocSetContextCreate(CurrentMemoryContext,
+                                                  "pax scan page layout",
+                                                  ALLOCSET_DEFAULT_SIZES);
     ItemPointerSetInvalid(&scan->tidrange_max);
     scan->tidrange_done = false;
 
@@ -1719,6 +1910,8 @@ pax_scan_end(TableScanDesc sscan)
     PaxScanDesc scan = (PaxScanDesc) sscan;
 
     pax_scan_unpin_current(scan);
+    pax_scan_drop_cached_desc(scan);
+    MemoryContextDelete(scan->desc_ctx);
 
     if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
         UnregisterSnapshot(scan->rs_base.rs_snapshot);
@@ -1736,6 +1929,7 @@ pax_scan_rescan(TableScanDesc sscan, ScanKey key,
 
     (void) key;
     pax_scan_unpin_current(scan);
+    pax_scan_drop_cached_desc(scan);
     scan->current_tupno = -1;
     scan->current_block = 0;
     scan->nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
@@ -1785,6 +1979,58 @@ pax_scan_lock_current_page(PaxScanDesc scan, Relation rel)
     return scan->current_buf;
 }
 
+/* Jette la mise en page en cache, sans détruire son contexte. */
+static void
+pax_scan_drop_cached_desc(PaxScanDesc scan)
+{
+    if (scan->cached_desc)
+    {
+        pax_free_page_desc(scan->cached_desc);
+        scan->cached_desc = NULL;
+    }
+}
+
+/*
+ * Renvoie un descripteur exploitable pour la page courante, en réutilisant la
+ * mise en page si l'en-tête de page n'a pas bougé.
+ *
+ * L'appelant doit détenir le verrou de contenu sur la page : c'est lui qui
+ * garantit que desc->header et desc->minipages[].data restent valides. Les
+ * métadonnées de version sont recopiées à chaque appel quoi qu'il arrive.
+ */
+static PaxPageDesc *
+pax_scan_page_desc(PaxScanDesc scan, Page page, BlockNumber blkno,
+                   TupleDesc tupdesc)
+{
+    PaxPageHeader  *phdr = PaxPageHeaderPtr(page);
+    MemoryContext   oldc;
+    PaxPageDesc    *desc;
+
+    /*
+     * Les deux branches travaillent dans desc_ctx : le rafraîchissement peut
+     * réallouer tuple_meta (si la page a gagné des versions), et cette
+     * mémoire doit appartenir au contexte du scan, pas à celui de l'appelant.
+     */
+    oldc = MemoryContextSwitchTo(scan->desc_ctx);
+
+    if (pax_layout_is_current(scan->cached_desc, page, blkno, phdr, tupdesc))
+    {
+        desc = scan->cached_desc;
+    }
+    else
+    {
+        pax_scan_drop_cached_desc(scan);
+        desc = pax_build_page_layout(page, blkno, tupdesc);
+        scan->cached_desc = desc;
+    }
+
+    pax_refresh_tuple_meta(desc, page);
+
+    MemoryContextSwitchTo(oldc);
+
+    return desc;
+}
+
 static bool
 pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
                      TupleTableSlot *slot)
@@ -1829,7 +2075,7 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
          * lock was dropped since the last call, so a concurrent inserter may
          * have memmoved this page and invalidated cached column pointers.
          */
-        pdesc = pax_build_page_desc(page, tupdesc);
+        pdesc = pax_scan_page_desc(scan, page, scan->current_block, tupdesc);
         tupno = pax_find_visible_tuple(scan, pdesc,
                                        scan->current_tupno + 1);
 
@@ -1839,10 +2085,14 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
              * Materialize before dropping the content lock.  A pin prevents
              * eviction, but an inserter may still memmove this page while the
              * slot is live; copied values are therefore mandatory.
+             *
+             * pdesc is the scan's cached descriptor: it stays alive across
+             * calls and is refreshed on the next one, so it must NOT be freed
+             * here. The slot owns only its own pin and its own copy of the
+             * version metadata.
              */
             pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
             ExecMaterializeSlot(slot);
-            pax_free_page_desc(pdesc);
 
             /*
              * Keep the pin, drop only the content lock, so that an UPDATE or
@@ -1854,7 +2104,6 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
             return true;
         }
 
-        pax_free_page_desc(pdesc);
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
         pax_scan_unpin_current(scan);
         scan->current_tupno = -1;
@@ -1873,6 +2122,7 @@ pax_scan_set_tidrange(TableScanDesc sscan, ItemPointer mintid,
     PaxScanDesc scan = (PaxScanDesc) sscan;
 
     pax_scan_unpin_current(scan);
+    pax_scan_drop_cached_desc(scan);
     scan->tidrange_done = false;
     scan->current_tupno = -1;
     scan->current_block = 0;
@@ -1956,7 +2206,7 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
                  scan->current_block, RelationGetRelationName(rel));
         }
 
-        pdesc = pax_build_page_desc(page, tupdesc);
+        pdesc = pax_scan_page_desc(scan, page, scan->current_block, tupdesc);
         tupno = pax_find_visible_tuple(scan, pdesc, start);
         if (tupno >= 0 &&
             ItemPointerIsValid(&scan->tidrange_max) &&
@@ -1968,13 +2218,11 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
         {
             pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
             ExecMaterializeSlot(slot);
-            pax_free_page_desc(pdesc);
             LockBuffer(buf, BUFFER_LOCK_UNLOCK);
             scan->current_tupno = tupno;
             return true;
         }
 
-        pax_free_page_desc(pdesc);
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
         pax_scan_unpin_current(scan);
         scan->current_tupno = -1;
@@ -2004,7 +2252,7 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
  * - pose le bit de NULL dans le bitmap de chaque colonne.
  *
  * Chaque mutation est appliquée via Generic WAL avant que la page puisse
- * atteindre le disque.  Reste à faire : gestion FSM et vacuum.
+ * atteindre le disque.  Reste à faire : vacuum.
  */
 #if PG_VERSION_NUM >= 190000
 static void
@@ -2027,7 +2275,6 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     TupleDesc       tupdesc = RelationGetDescr(rel);
     int             natts = tupdesc->natts;
     BlockNumber     nblocks;
-    BlockNumber     blk;
     int             tupno;
     int             i;
     Datum          *values;
@@ -2037,8 +2284,10 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     PaxTupleMetaData *meta;
     Size             needed;
     Size             available;
+    Size             hint;
     Size             meta_at;
     Size             meta_size;
+    BlockNumber      target;
     bool             page_is_new = false;
     bool             extension_locked = false;
 
@@ -2085,19 +2334,54 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     /* Coarse relation-level SSI check; PAX currently has only sequential scans. */
     CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
 
-    /* === 1. Choisir une page ayant assez de place (premier libre) === */
+    /*
+     * === 1. Choisir une page ayant assez de place, via le FSM ===
+     *
+     * Le parcours linéaire « premier bloc assez grand depuis 0 » coûtait un
+     * un ReadBuffer et un verrou par bloc déjà pleine. Le FSM répond en O(1)
+     * à « quelle page a de la place » et ne sert qu'à proposer une
+     * candidate : la place réelle est revérifiée sous verrou exclusif avant
+     * toute écriture.
+     *
+     * Contrairement à heap, le FSM est enregistré après chaque insertion
+     * réussie. Heap délègue ce travail à VACUUM ; PAX n'a pas de VACUUM,
+     * donc rien ne renseignerait jamais la carte et chaque insertion
+     * étendrait la relation.
+     */
+    hint   = pax_insert_space_hint(rel, values, isnulls);
     nblocks = RelationGetNumberOfBlocks(rel);
 
-    for (blk = 0; blk < nblocks; blk++)
+    /* 1a) la page cible mémorisée par ce backend (relcache), si elle existe */
+    target = RelationGetTargetBlock(rel);
+    if (target != InvalidBlockNumber && target >= nblocks)
+        target = InvalidBlockNumber;      /* relation rétrécie : invalide */
+
+    if (target == InvalidBlockNumber)
+    {
+        /* 1b) le FSM */
+        target = GetPageWithFreeSpace(rel, hint);
+        if (target == InvalidBlockNumber && nblocks > 0)
+        {
+            /*
+             * FSM muet (relation qui démarre, ou entrées absentes après un
+             * crash) : on tente la dernière page, comme heap, pour éviter le
+             * syndrome « une ligne par page » au démarrage.
+             */
+            target = nblocks - 1;
+        }
+    }
+
+    while (target != InvalidBlockNumber && target < nblocks)
     {
         Buffer          b;
         Page            p;
         PaxSpecialData *special;
         PaxPageHeader  *h;
+        Size            free_space;
 
         CHECK_FOR_INTERRUPTS();
-        b = ReadBuffer(rel, blk);
 
+        b = ReadBuffer(rel, target);
         LockBuffer(b, BUFFER_LOCK_EXCLUSIVE);
         p = BufferGetPage(b);
 
@@ -2112,7 +2396,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
             UnlockReleaseBuffer(b);
             elog(ERROR, "pax: invalid page %u in relation \"%s\"",
-                 blk, RelationGetRelationName(rel));
+                 target, RelationGetRelationName(rel));
         }
 
         special = (PaxSpecialData *) PageGetSpecialPointer(p);
@@ -2124,17 +2408,24 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         }
 
         /* n_tuples lu APRÈS le lock : l'état peut avoir changé */
-        h      = PaxPageHeaderPtr(p);
-        needed = pax_insert_space_needed(rel, values, isnulls, h->n_tuples,
-                                         PaxPageHeaderPtr(p));
+        h          = PaxPageHeaderPtr(p);
+        needed     = pax_insert_space_needed(rel, values, isnulls, h->n_tuples,
+                                             h);
+        free_space = pax_page_free_space(p);
 
-        if (pax_page_free_space(p) >= needed)
+        if (free_space >= needed)
         {
             buf = b;
             break;
         }
 
+        /*
+         * Pas assez de place : le FSM était optimiste (ou périmé). On
+         * enregistre l'état réel de cette page, ce qui l'exclut du parcours,
+         * puis on demande un autre candidat.
+         */
         UnlockReleaseBuffer(b);
+        target = RecordAndGetPageWithFreeSpace(rel, target, free_space, hint);
     }
 
     if (!BufferIsValid(buf))
@@ -2341,7 +2632,24 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         pslot->tuple_meta = *meta;
     }
 
+    available = pax_page_free_space(page);
+
     GenericXLogFinish(wal_state);
+
+    /*
+     * Memorise la page comme cible des insertions suivantes de ce backend, et
+     * publie l'espace libre restant dans le FSM.
+     *
+     * On le fait APRÈS GenericXLogFinish() pour que l'espace publié soit
+     * conforme à ce qui est réellement sur la page. PAX ne rend jamais
+     * d'espace libre par elle-même (UPDATE et DELETE n'écrivent que dans les
+     * métadonnées de version, déjà allouées) : l'espace ne fait donc que
+     * décroître, et cette mise à jour suffit entre deux VACUUM.
+     */
+    RelationSetTargetBlock(rel, BufferGetBlockNumber(buf));
+    if (available < BLCKSZ)
+        RecordPageWithFreeSpace(rel, BufferGetBlockNumber(buf), available);
+
     if (extension_locked)
         UnlockRelationForExtension(rel, ExclusiveLock);
     UnlockReleaseBuffer(buf);

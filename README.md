@@ -4,8 +4,9 @@ PAX (“Partition Attributes Across”) is a PostgreSQL table access-method
 prototype using a column-oriented physical page layout.
 
 The current prototype supports sequential and TID INSERT/UPDATE/DELETE/SELECT,
-basic MVCC version chains, row locking, COPY, byte-packed columnar storage, and
-Generic WAL crash recovery for PostgreSQL 19devel. It does **not** implement
+basic MVCC version chains, row locking, COPY, byte-packed columnar storage,
+free-space-map-driven inserts, and Generic WAL crash recovery for PostgreSQL
+19devel. It does **not** implement
 indexes, VACUUM, freezing, speculative insertion, or a page-version migration,
 and must not be used for production data.
 
