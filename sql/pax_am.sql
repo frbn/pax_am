@@ -160,8 +160,12 @@ DROP TABLE tpax_mvcc;
 -- committed version.
 --
 CREATE TABLE tpax_dml (id int, payload text) USING pax;
+SELECT pg_current_wal_insert_lsn() AS before_insert_wal \gset
 INSERT INTO tpax_dml VALUES (1, 'old'), (2, 'keep');
+SELECT pg_current_wal_insert_lsn() > :'before_insert_wal'::pg_lsn
+       AS insert_wrote_wal;
 SELECT ctid AS old_tid FROM tpax_dml WHERE id = 1 \gset
+SELECT pg_current_wal_insert_lsn() AS before_update_wal \gset
 
 UPDATE tpax_dml
 SET payload = 'new'
@@ -170,6 +174,8 @@ RETURNING id, payload, ctid <> :'old_tid' AS relocated,
           xmin <> '0'::xid AS has_xmin,
           xmax = '0'::xid AS no_xmax,
           cmin = cmax AS shared_command;
+SELECT pg_current_wal_insert_lsn() > :'before_update_wal'::pg_lsn
+       AS update_wrote_wal;
 SELECT array_agg(id ORDER BY id) AS ids,
        array_agg(payload ORDER BY id) AS payloads
 FROM tpax_dml;
@@ -196,7 +202,10 @@ SELECT payload FROM tpax_dml WHERE id = 1;
 -- reflected by the UPDATE RETURNING slot.  Heavyweight tuple locks are only
 -- short-lived waiter arbitration and are not retained.
 BEGIN;
+SELECT pg_current_wal_insert_lsn() AS before_lock_wal \gset
 SELECT id FROM tpax_dml WHERE id = 2 FOR UPDATE;
+SELECT pg_current_wal_insert_lsn() > :'before_lock_wal'::pg_lsn
+       AS lock_wrote_wal;
 UPDATE tpax_dml SET payload = 'carried lock'
 WHERE id = 2
 RETURNING payload, xmax <> '0'::xid AS lock_visible;
@@ -205,11 +214,14 @@ FROM pg_locks WHERE locktype = 'tuple';
 ROLLBACK;
 SELECT payload FROM tpax_dml WHERE id = 2;
 
+SELECT pg_current_wal_insert_lsn() AS before_delete_wal \gset
 DELETE FROM tpax_dml
 WHERE id = 1
 RETURNING id, payload,
           xmax = pg_current_xact_id()::text::xid AS deleting_xid,
           cmax IS NOT NULL AS has_cmax;
+SELECT pg_current_wal_insert_lsn() > :'before_delete_wal'::pg_lsn
+       AS delete_wrote_wal;
 SELECT array_agg(id ORDER BY id) AS remaining_ids FROM tpax_dml;
 
 BEGIN;

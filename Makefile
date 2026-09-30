@@ -17,3 +17,15 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+SHARED_BUFFERS_TEST = tests/compare_shared_buffers.sh
+COLUMNAR_BENCHMARK  = tests/benchmark_columnar.sh
+
+.PHONY: shared-buffers-test columnar-benchmark
+shared-buffers-test:
+	$(SHARED_BUFFERS_TEST)
+
+# Mesure les effets reels de la disposition columnaire face a heap.
+# Hors installcheck : resultats dependants de la machine, aucun golden.
+columnar-benchmark:
+	$(COLUMNAR_BENCHMARK)
+

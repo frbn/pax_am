@@ -17,7 +17,8 @@
  * Limitations :
  *   - pas de FSM réel (recherche first-fit linéaire sur les pages)
  *   - versions UPDATE / DELETE append-only, sans VACUUM ni gel des tuples
- *   - pas de Generic WAL (perte potentielle en cas de crash)
+ *   - Generic WAL couvre les mutations de page ; l'insertion spéculative reste
+ *     non supportée
  *   - pas d'index, de parallélisme ou d'opérations DDL non réécrivantes
  *
  */
@@ -27,6 +28,7 @@
 #include "access/tableam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/generic_xlog.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/sysattr.h"
@@ -209,6 +211,19 @@ typedef struct PaxScanDescData
     BlockNumber     nblocks;
     ItemPointerData tidrange_max;
     bool            tidrange_done;
+
+    /*
+     * Pin on the page being scanned, held across getnextslot calls exactly
+     * like heap's rs_cbuf.  PaxPageDesc stores raw pointers into the page
+     * (mp->data, desc->header), so the page must stay pinned for as long as a
+     * descriptor derived from it can be in use.
+     *
+     * The content lock is deliberately NOT held here: it is taken and dropped
+     * inside each call, after the tuple has been materialized.  Holding a
+     * share content lock across calls would self-deadlock an UPDATE or DELETE
+     * that needs to modify a tuple on this very block.
+     */
+    Buffer          current_buf;
 } PaxScanDescData;
 
 typedef PaxScanDescData *PaxScanDesc;
@@ -283,6 +298,8 @@ static void         pax_scan_set_tidrange(TableScanDesc sscan,
 static bool         pax_scan_getnextslot_tidrange(TableScanDesc sscan,
                                                   ScanDirection direction,
                                                   TupleTableSlot *slot);
+static void         pax_scan_unpin_current(PaxScanDesc scan);
+static Buffer       pax_scan_lock_current_page(PaxScanDesc scan, Relation rel);
 
 /* Tuple lookup / visibility */
 static bool         pax_tuple_fetch_row_version(Relation rel, ItemPointer tid,
@@ -1607,6 +1624,7 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
     scan->current_tupno  = -1;
     scan->current_block  = 0;
     scan->nblocks        = RelationGetNumberOfBlocks(rel);
+    scan->current_buf    = InvalidBuffer;
     ItemPointerSetInvalid(&scan->tidrange_max);
     scan->tidrange_done = false;
 
@@ -1619,6 +1637,8 @@ static void
 pax_scan_end(TableScanDesc sscan)
 {
     PaxScanDesc scan = (PaxScanDesc) sscan;
+
+    pax_scan_unpin_current(scan);
 
     if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
         UnregisterSnapshot(scan->rs_base.rs_snapshot);
@@ -1635,11 +1655,54 @@ pax_scan_rescan(TableScanDesc sscan, ScanKey key,
     PaxScanDesc scan = (PaxScanDesc) sscan;
 
     (void) key;
+    pax_scan_unpin_current(scan);
     scan->current_tupno = -1;
     scan->current_block = 0;
     scan->nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
     ItemPointerSetInvalid(&scan->tidrange_max);
     scan->tidrange_done = false;
+}
+
+/*
+ * Drop the pin taken on the current page, if any.
+ */
+static void
+pax_scan_unpin_current(PaxScanDesc scan)
+{
+    if (BufferIsValid(scan->current_buf))
+    {
+        ReleaseBuffer(scan->current_buf);
+        scan->current_buf = InvalidBuffer;
+    }
+}
+
+/*
+ * Return scan->current_block pinned and content-locked for reading.
+ *
+ * When the previous call left a pin on this very block we reuse it and only
+ * re-take the content lock; that is a pin-count lookup rather than a buffer
+ * manager read, which is what removes the per-tuple ReadBuffer cost measured
+ * in the shared-buffer comparison test.
+ *
+ * The caller owns the returned content lock and must drop it with
+ * LockBuffer(buf, BUFFER_LOCK_UNLOCK) -- deliberately not
+ * UnlockReleaseBuffer(), because the pin stays cached in the scan.
+ */
+static Buffer
+pax_scan_lock_current_page(PaxScanDesc scan, Relation rel)
+{
+    if (BufferIsValid(scan->current_buf) &&
+        BufferGetBlockNumber(scan->current_buf) == scan->current_block)
+    {
+        LockBuffer(scan->current_buf, BUFFER_LOCK_SHARE);
+        return scan->current_buf;
+    }
+
+    pax_scan_unpin_current(scan);
+    scan->current_buf = ReadBuffer(rel, scan->current_block);
+    LockBuffer(scan->current_buf, BUFFER_LOCK_SHARE);
+
+    return scan->current_buf;
 }
 
 static bool
@@ -1670,17 +1733,22 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 
         CHECK_FOR_INTERRUPTS();
 
-        buf = ReadBuffer(rel, scan->current_block);
-        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        buf = pax_scan_lock_current_page(scan, rel);
         page = BufferGetPage(buf);
 
         if (!pax_page_is_valid(page))
         {
-            UnlockReleaseBuffer(buf);
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            pax_scan_unpin_current(scan);
             elog(ERROR, "pax: invalid page %u in relation \"%s\"",
                  scan->current_block, RelationGetRelationName(rel));
         }
 
+        /*
+         * Rebuilt on every call even though the pin is reused: the content
+         * lock was dropped since the last call, so a concurrent inserter may
+         * have memmoved this page and invalidated cached column pointers.
+         */
         pdesc = pax_build_page_desc(page, tupdesc);
         tupno = pax_find_visible_tuple(scan, pdesc,
                                        scan->current_tupno + 1);
@@ -1695,17 +1763,25 @@ pax_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
             pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
             ExecMaterializeSlot(slot);
             pax_free_page_desc(pdesc);
-            UnlockReleaseBuffer(buf);
+
+            /*
+             * Keep the pin, drop only the content lock, so that an UPDATE or
+             * DELETE of this tuple can still take an exclusive lock.
+             */
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
             scan->current_tupno = tupno;
             return true;
         }
 
         pax_free_page_desc(pdesc);
-        UnlockReleaseBuffer(buf);
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        pax_scan_unpin_current(scan);
         scan->current_tupno = -1;
         scan->current_block++;
     }
+
+    pax_scan_unpin_current(scan);
 
     return false;
 }
@@ -1716,6 +1792,7 @@ pax_scan_set_tidrange(TableScanDesc sscan, ItemPointer mintid,
 {
     PaxScanDesc scan = (PaxScanDesc) sscan;
 
+    pax_scan_unpin_current(scan);
     scan->tidrange_done = false;
     scan->current_tupno = -1;
     scan->current_block = 0;
@@ -1789,12 +1866,12 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
             }
         }
 
-        buf = ReadBuffer(rel, scan->current_block);
-        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        buf = pax_scan_lock_current_page(scan, rel);
         page = BufferGetPage(buf);
         if (!pax_page_is_valid(page))
         {
-            UnlockReleaseBuffer(buf);
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            pax_scan_unpin_current(scan);
             elog(ERROR, "pax: invalid page %u in relation \"%s\"",
                  scan->current_block, RelationGetRelationName(rel));
         }
@@ -1812,13 +1889,14 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
             pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
             ExecMaterializeSlot(slot);
             pax_free_page_desc(pdesc);
-            UnlockReleaseBuffer(buf);
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
             scan->current_tupno = tupno;
             return true;
         }
 
         pax_free_page_desc(pdesc);
-        UnlockReleaseBuffer(buf);
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        pax_scan_unpin_current(scan);
         scan->current_tupno = -1;
         if (ItemPointerIsValid(&scan->tidrange_max) &&
             scan->current_block == max_block)
@@ -1826,6 +1904,8 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
         else
             scan->current_block++;
     }
+
+    pax_scan_unpin_current(scan);
 
     return false;
 }
@@ -1843,7 +1923,8 @@ pax_scan_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
  *   memmove vers la droite (pd_lower montante),
  * - pose le bit de NULL dans le bitmap de chaque colonne.
  *
- * Reste à faire : Generic WAL, gestion FSM et vacuum.
+ * Chaque mutation est appliquée via Generic WAL avant que la page puisse
+ * atteindre le disque.  Reste à faire : gestion FSM et vacuum.
  */
 #if PG_VERSION_NUM >= 190000
 static void
@@ -1862,6 +1943,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     Page            page;
     PageHeader      pghdr;
     PaxPageHeader  *phdr;
+    GenericXLogState *wal_state;
     TupleDesc       tupdesc = RelationGetDescr(rel);
     int             natts = tupdesc->natts;
     BlockNumber     nblocks;
@@ -1877,6 +1959,8 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     Size             available;
     Size             meta_at;
     Size             meta_size;
+    bool             page_is_new = false;
+    bool             extension_locked = false;
 
     if (IsParallelWorker())
         ereport(ERROR,
@@ -1940,13 +2024,15 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         if (!pax_page_is_valid(p))
         {
             if (PageIsNew(p))
-                pax_page_init(p, natts);
-            else
             {
-                UnlockReleaseBuffer(b);
-                elog(ERROR, "pax: invalid page %u in relation \"%s\"",
-                     blk, RelationGetRelationName(rel));
+                buf = b;
+                page_is_new = true;
+                break;
             }
+
+            UnlockReleaseBuffer(b);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 blk, RelationGetRelationName(rel));
         }
 
         special = (PaxSpecialData *) PageGetSpecialPointer(p);
@@ -1978,6 +2064,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
          * same new block before either has initialized it.
          */
         LockRelationForExtension(rel, ExclusiveLock);
+        extension_locked = true;
         buf = ReadBuffer(rel, P_NEW);
         LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
         page = BufferGetPage(buf);
@@ -1987,14 +2074,29 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
             UnlockRelationForExtension(rel, ExclusiveLock);
             elog(ERROR, "pax: concurrent extension returned a non-new page");
         }
-        pax_page_init(page, natts);
-        UnlockRelationForExtension(rel, ExclusiveLock);
+        page_is_new = true;
+    }
 
+    /*
+     * Mutate a private page image.  GenericXLogFinish() applies it to the
+     * shared buffer and emits the WAL record atomically, so the page can
+     * never reach disk before its WAL.
+     */
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf,
+                                     page_is_new ?
+                                     GENERIC_XLOG_FULL_IMAGE : 0);
+    if (page_is_new)
+    {
+        pax_page_init(page, natts);
         needed = pax_insert_space_needed(rel, values, isnulls, 0);
         available = pax_page_free_space(page);
         if (available < needed)
         {
+            GenericXLogAbort(wal_state);
             UnlockReleaseBuffer(buf);
+            if (extension_locked)
+                UnlockRelationForExtension(rel, ExclusiveLock);
             ereport(ERROR,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("pax: row is too large for one page"),
@@ -2003,14 +2105,16 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         }
     }
 
-    page  = BufferGetPage(buf);
     pghdr = (PageHeader) page;
     phdr  = PaxPageHeaderPtr(page);
     tupno = phdr->n_tuples;
 
     if (tupno >= MaxOffsetNumber)
     {
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
+        if (extension_locked)
+            UnlockRelationForExtension(rel, ExclusiveLock);
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                  errmsg("pax: too many tuples on page %u",
@@ -2154,9 +2258,9 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         pslot->tuple_meta = *meta;
     }
 
-    /* TODO: Generic WAL */
-
-    MarkBufferDirty(buf);
+    GenericXLogFinish(wal_state);
+    if (extension_locked)
+        UnlockRelationForExtension(rel, ExclusiveLock);
     UnlockReleaseBuffer(buf);
 
     pfree(values);
@@ -2333,24 +2437,30 @@ pax_set_locker_mxid(Relation rel, const ItemPointerData *tid,
     BlockNumber blkno = ItemPointerGetBlockNumber(tid);
     OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
     Buffer buf;
+    Page page;
+    GenericXLogState *wal_state;
     PaxPageDesc *pdesc;
     PaxTupleMetaData meta;
     int tupno;
 
     buf = ReadBuffer(rel, blkno);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-    if (!pax_page_is_valid(BufferGetPage(buf)))
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf, 0);
+    if (!pax_page_is_valid(page))
     {
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         elog(ERROR, "pax: invalid page %u while storing tuple locks",
              blkno);
     }
 
-    pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+    pdesc = pax_build_page_desc(page, RelationGetDescr(rel));
     tupno = (int) offset - 1;
     if (tupno < 0 || tupno >= pdesc->n_tuples)
     {
         pax_free_page_desc(pdesc);
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         elog(ERROR, "pax: tuple offset does not exist while storing locks");
     }
@@ -2361,15 +2471,16 @@ pax_set_locker_mxid(Relation rel, const ItemPointerData *tid,
     {
         if (updated_meta != NULL)
             *updated_meta = meta;
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         return;
     }
 
     meta.locker_mxid = locker_mxid;
-    *pax_page_tuple_meta(BufferGetPage(buf), tupno) = meta;
+    *pax_page_tuple_meta(page, tupno) = meta;
     if (updated_meta != NULL)
         *updated_meta = meta;
-    MarkBufferDirty(buf);
+    GenericXLogFinish(wal_state);
     UnlockReleaseBuffer(buf);
 }
 
@@ -2612,6 +2723,8 @@ pax_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
                  bool wait, TM_FailureData *tmfd)
 {
     Buffer          buf = InvalidBuffer;
+    Page            page;
+    GenericXLogState *wal_state;
     PaxPageDesc    *pdesc = NULL;
     PaxTupleMetaData meta;
     ItemPointerData self_tid;
@@ -2653,9 +2766,11 @@ pax_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
     meta.xmax = xid;
     meta.cmax = cid;
     ItemPointerCopy(&self_tid, &meta.t_ctid);
-    *pax_page_tuple_meta(BufferGetPage(buf),
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf, 0);
+    *pax_page_tuple_meta(page,
                           ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
-    MarkBufferDirty(buf);
+    GenericXLogFinish(wal_state);
 
     pax_free_page_desc(pdesc);
     UnlockReleaseBuffer(buf);
@@ -2672,6 +2787,8 @@ pax_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
                  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
     Buffer          buf = InvalidBuffer;
+    Page            page;
+    GenericXLogState *wal_state;
     PaxPageDesc    *pdesc = NULL;
     PaxTupleMetaData meta;
     PaxTupleMetaData new_meta;
@@ -2730,9 +2847,11 @@ pax_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
     meta.xmax = xid;
     meta.cmax = cid;
     ItemPointerCopy(&self_tid, &meta.t_ctid);
-    *pax_page_tuple_meta(BufferGetPage(buf),
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf, 0);
+    *pax_page_tuple_meta(page,
                           ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
-    MarkBufferDirty(buf);
+    GenericXLogFinish(wal_state);
     pax_free_page_desc(pdesc);
     UnlockReleaseBuffer(buf);
 
@@ -2754,15 +2873,19 @@ pax_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
     /* Re-find the old version because insertion may have moved its metadata. */
     buf = ReadBuffer(rel, ItemPointerGetBlockNumber(&self_tid));
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-    if (!pax_page_is_valid(BufferGetPage(buf)))
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf, 0);
+    if (!pax_page_is_valid(page))
     {
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         elog(ERROR, "pax: invalid old-version page after UPDATE");
     }
-    pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+    pdesc = pax_build_page_desc(page, RelationGetDescr(rel));
     if ((int) ItemPointerGetOffsetNumber(&self_tid) - 1 >= pdesc->n_tuples)
     {
         pax_free_page_desc(pdesc);
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         elog(ERROR, "pax: old UPDATE version disappeared");
     }
@@ -2771,14 +2894,15 @@ pax_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
         !ItemPointerEquals(&meta.t_ctid, &self_tid))
     {
         pax_free_page_desc(pdesc);
+        GenericXLogAbort(wal_state);
         UnlockReleaseBuffer(buf);
         elog(ERROR, "pax: old UPDATE version changed unexpectedly");
     }
 
     ItemPointerCopy(&new_tid, &meta.t_ctid);
-    *pax_page_tuple_meta(BufferGetPage(buf),
+    *pax_page_tuple_meta(page,
                           ItemPointerGetOffsetNumber(&self_tid) - 1) = meta;
-    MarkBufferDirty(buf);
+    GenericXLogFinish(wal_state);
     pax_free_page_desc(pdesc);
     UnlockReleaseBuffer(buf);
 

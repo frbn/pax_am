@@ -287,8 +287,17 @@ DROP TABLE tpax_mvcc;
 -- committed version.
 --
 CREATE TABLE tpax_dml (id int, payload text) USING pax;
+SELECT pg_current_wal_insert_lsn() AS before_insert_wal \gset
 INSERT INTO tpax_dml VALUES (1, 'old'), (2, 'keep');
+SELECT pg_current_wal_insert_lsn() > :'before_insert_wal'::pg_lsn
+       AS insert_wrote_wal;
+ insert_wrote_wal 
+------------------
+ t
+(1 row)
+
 SELECT ctid AS old_tid FROM tpax_dml WHERE id = 1 \gset
+SELECT pg_current_wal_insert_lsn() AS before_update_wal \gset
 UPDATE tpax_dml
 SET payload = 'new'
 WHERE id = 1
@@ -299,6 +308,13 @@ RETURNING id, payload, ctid <> :'old_tid' AS relocated,
  id | payload | relocated | has_xmin | no_xmax | shared_command 
 ----+---------+-----------+----------+---------+----------------
   1 | new     | t         | t        | t       | t
+(1 row)
+
+SELECT pg_current_wal_insert_lsn() > :'before_update_wal'::pg_lsn
+       AS update_wrote_wal;
+ update_wrote_wal 
+------------------
+ t
 (1 row)
 
 SELECT array_agg(id ORDER BY id) AS ids,
@@ -354,10 +370,18 @@ SELECT payload FROM tpax_dml WHERE id = 1;
 -- reflected by the UPDATE RETURNING slot.  Heavyweight tuple locks are only
 -- short-lived waiter arbitration and are not retained.
 BEGIN;
+SELECT pg_current_wal_insert_lsn() AS before_lock_wal \gset
 SELECT id FROM tpax_dml WHERE id = 2 FOR UPDATE;
  id 
 ----
   2
+(1 row)
+
+SELECT pg_current_wal_insert_lsn() > :'before_lock_wal'::pg_lsn
+       AS lock_wrote_wal;
+ lock_wrote_wal 
+----------------
+ t
 (1 row)
 
 UPDATE tpax_dml SET payload = 'carried lock'
@@ -382,6 +406,7 @@ SELECT payload FROM tpax_dml WHERE id = 2;
  keep
 (1 row)
 
+SELECT pg_current_wal_insert_lsn() AS before_delete_wal \gset
 DELETE FROM tpax_dml
 WHERE id = 1
 RETURNING id, payload,
@@ -390,6 +415,13 @@ RETURNING id, payload,
  id | payload | deleting_xid | has_cmax 
 ----+---------+--------------+----------
   1 | first   | t            | t
+(1 row)
+
+SELECT pg_current_wal_insert_lsn() > :'before_delete_wal'::pg_lsn
+       AS delete_wrote_wal;
+ delete_wrote_wal 
+------------------
+ t
 (1 row)
 
 SELECT array_agg(id ORDER BY id) AS remaining_ids FROM tpax_dml;
