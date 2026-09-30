@@ -270,6 +270,71 @@ SELECT count(*) AS chain_rows,
 FROM tpax_chain;
 DROP TABLE tpax_chain;
 
+-- ANALYZE (scan_analyze_next_block / scan_analyze_next_tuple)
+CREATE TABLE tpax_analyze (id int, grp int, val numeric) USING pax;
+INSERT INTO tpax_analyze
+SELECT g, g % 10, g * 1.5 FROM generate_series(1, 3000) g;
+-- Three tenths of the rows die, so VACUUM/ANALYZE must report them as dead.
+DELETE FROM tpax_analyze WHERE id % 10 < 3;
+ANALYZE tpax_analyze;
+SELECT count(*) AS analyzed_rows
+FROM tpax_analyze;
+SELECT attname, null_frac
+FROM pg_stats
+WHERE tablename = 'tpax_analyze' AND attname = 'id';
+DROP TABLE tpax_analyze;
+
+-- VACUUM (relation_vacuum callback)
+--
+-- Dead versions are marked in place rather than compacted: t_ctid links are
+-- physical (page, version index), and removing a version would shift every
+-- following slot in every column and break inbound links from other pages.
+-- A stale link must therefore resolve to an invisible version, not to a
+-- shifted one.
+CREATE TABLE tpax_vacuum (id int, payload text) USING pax;
+INSERT INTO tpax_vacuum
+SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+
+-- Build a chain three deep, then delete the head: after VACUUM the two
+-- predecessors are reclaimed while the live version must stay reachable.
+UPDATE tpax_vacuum SET payload = payload || '-u1' WHERE id <= 500;
+UPDATE tpax_vacuum SET payload = payload || '-u2' WHERE id <= 200;
+DELETE FROM tpax_vacuum WHERE id <= 50;
+
+VACUUM tpax_vacuum;
+
+-- The surviving chain must still read back exactly as before.
+SELECT count(*) AS vacuum_rows,
+       count(*) FILTER (WHERE payload <> expected) AS mismatched
+FROM (
+    SELECT payload,
+           CASE WHEN id <= 200 THEN 'v' || id || '-u1-u2'
+                WHEN id <= 500 THEN 'v' || id || '-u1'
+                ELSE 'v' || id END AS expected
+    FROM tpax_vacuum
+) s;
+
+-- A row lock and an update must still follow the chain after vacuum.
+BEGIN;
+SELECT id FROM tpax_vacuum WHERE id = 300 FOR UPDATE;
+COMMIT;
+UPDATE tpax_vacuum SET payload = payload || '-u3' WHERE id = 300;
+SELECT payload FROM tpax_vacuum WHERE id = 300;
+
+-- Fully empty trailing pages are truncated away.
+CREATE TABLE tpax_truncate (id int, payload text) USING pax;
+INSERT INTO tpax_truncate
+SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+SELECT pg_relation_size('tpax_truncate') / 8192 AS pages_before_vacuum
+FROM tpax_truncate LIMIT 1;
+DELETE FROM tpax_truncate;
+VACUUM tpax_truncate;
+SELECT count(*) AS truncated_rows,
+       pg_relation_size('tpax_truncate') / 8192 AS pages_after_vacuum
+FROM tpax_truncate;
+DROP TABLE tpax_vacuum;
+DROP TABLE tpax_truncate;
+
 -- TRUNCATE (relation_nontransactional_truncate callback)
 TRUNCATE tpax;
 SELECT count(*) FROM tpax;

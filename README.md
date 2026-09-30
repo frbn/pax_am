@@ -5,10 +5,13 @@ prototype using a column-oriented physical page layout.
 
 The current prototype supports sequential and TID INSERT/UPDATE/DELETE/SELECT,
 basic MVCC version chains, row locking, COPY, byte-packed columnar storage,
-free-space-map-driven inserts, and Generic WAL crash recovery for PostgreSQL
-19devel. It does **not** implement
-indexes, VACUUM, freezing, speculative insertion, or a page-version migration,
-and must not be used for production data.
+free-space-map-driven inserts, VACUUM/ANALYZE, and Generic WAL crash recovery
+for PostgreSQL 19devel.
+
+It does **not** implement indexes, speculative insertion, or a page-version
+migration, and must not be used for production data. VACUUM marks dead versions
+and freezes them, but reclaims space only by truncating trailing pages: the slots
+it frees are not yet reused by INSERT.
 
 Build and test against a configured PostgreSQL 19 installation with:
 

@@ -38,6 +38,7 @@
 #include "access/xact.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
+#include "commands/vacuum.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "common/relpath.h"
@@ -79,6 +80,19 @@ PG_MODULE_MAGIC;
 #define PAX_FLAG_COMPRESSED         0x0004
 #define PAX_FLAG_HAS_XMIN_XMAX      0x0008
 #define PAX_FLAG_HAS_VERSIONS       0x0010
+
+/*
+ * Bit de PaxTupleMetaData.flags marquant une version désormais inutilisée.
+ *
+ * VACUUM ne compacte pas les régions : elles sont columnaires, et retirer une
+ * version décalerait les slots de toutes les colonnes, ce qui casserait les
+ * liens t_ctid entrants pointant sur des offsets physiques. La version est
+ * donc marquee sur place, et INSERT reutilise son emplacement.
+ *
+ * Le champ 'flags' devait etre nul en version 3 ; la version 4 lui donne
+ * cette affectation.
+ */
+#define PAX_VERSION_UNUSED          0x0001
 
 /* bits8 abandonned in v19*/
 #if PG_VERSION_NUM >= 190000
@@ -241,6 +255,9 @@ typedef struct PaxScanDescData
     ItemPointerData tidrange_max;
     bool            tidrange_done;
 
+    /* ANALYZE : la page courante est épuisée quand la boucle interne s'arrête. */
+    bool            analyze_done;
+
     /*
      * Pin on the page being scanned, held across getnextslot calls exactly
      * like heap's rs_cbuf.  PaxPageDesc stores raw pointers into the page
@@ -335,6 +352,85 @@ static MinimalTuple pax_slot_copy_minimal_tuple(TupleTableSlot *slot,
 static TableScanDesc pax_scan_begin(Relation rel, Snapshot snapshot,
                                     int nkeys, ScanKey key,
                                     ParallelTableScanDesc pscan, uint32 flags);
+/*
+ * Etat d'une version pour l'analyse et le nettoyage.
+ *
+ * Il ne s'agit PAS de la visibilité MVCC d'un snapshot : c'est la question
+ * « cette version peut-elle encore être utile ? », celle que se pose VACUUM.
+ */
+typedef enum PaxVersionState
+{
+    PAX_VERSION_LIVE,          /* inserée et non supprimée */
+    PAX_VERSION_DEAD,          /* insertion annulée, ou suppression validée */
+    PAX_VERSION_RECENT         /* en cours : ni supprimable, ni comptabilisable */
+} PaxVersionState;
+
+static bool
+pax_meta_is_unused(const PaxTupleMetaData *meta)
+{
+    return (meta->flags & PAX_VERSION_UNUSED) != 0;
+}
+
+/*
+ * Classe une version pour VACUUM et ANALYZE.
+ *
+ * Une version est morte si son insertion a été annulée (xmin aborté : la ligne
+ * n'a jamais existé pour personne) ou si sa suppression a été validée. Les
+ * lignes verrouillées ne passent pas par xmax : elles sont dans locker_mxid,
+ * ce qui évite de les confondre avec une suppression.
+ */
+static PaxVersionState
+pax_meta_classify(const PaxTupleMetaData *meta)
+{
+    if (pax_meta_is_unused(meta))
+        return PAX_VERSION_DEAD;
+
+    if (!TransactionIdIsValid(meta->xmin))
+        return PAX_VERSION_RECENT;
+
+    if (TransactionIdDidAbort(meta->xmin))
+        return PAX_VERSION_DEAD;
+
+    if (TransactionIdIsCurrentTransactionId(meta->xmin))
+        return PAX_VERSION_LIVE;
+
+    if (!TransactionIdDidCommit(meta->xmin))
+        return PAX_VERSION_RECENT;
+
+    if (!TransactionIdIsValid(meta->xmax))
+        return PAX_VERSION_LIVE;
+
+    if (TransactionIdDidAbort(meta->xmax))
+        return PAX_VERSION_LIVE;
+
+    if (!TransactionIdDidCommit(meta->xmax))
+        return PAX_VERSION_RECENT;
+
+    return PAX_VERSION_DEAD;
+}
+
+/*
+ * Vrai si un verrou de ligne peut encore empêcher la réutilisation d'une
+ * version : un membre du MultiXact en cours suffit.
+ */
+static bool
+pax_meta_has_live_locker(const PaxTupleMetaData *meta)
+{
+    if (!MultiXactIdIsValid(meta->locker_mxid))
+        return false;
+
+    /*
+     * isLockOnly : le MultiXact de PAX ne contient que des verrous de ligne,
+     * jamais qu'un verrou. Un membre encore en cours suffit à interdire la
+     * réutilisation de l'emplacement.
+     *
+     * Cette forme est préférée à GetMultiXactIdMembers() car le tableau
+     * renvoyé par cette dernière pointe dans le cache local de MultiXact :
+     * il ne doit pas être libéré, et le parcours coûterait un accès SLRU.
+     */
+    return MultiXactIdIsRunning(meta->locker_mxid, true /* isLockOnly */);
+}
+
 static void         pax_scan_end(TableScanDesc sscan);
 static void         pax_scan_rescan(TableScanDesc sscan, ScanKey key,
                                     bool set_params, bool allow_strat,
@@ -594,25 +690,387 @@ pax_relation_copy_for_cluster(Relation oldtable, Relation newtable,
     pax_report_unsupported("CLUSTER");
 }
 
+/*
+ * VACUUM, passe de nettoyage sur une page.
+ *
+ * Contrainte propre au format : les liens t_ctid sont des offsets PHYSIQUES
+ * (page, indice de version). Retirer une version décalerait tous les slots
+ * suivants de toutes les colonnes, et casserait les liens entrants pointant
+ * sur cette page depuis d'autres. On ne compacte donc pas : une version morte
+ * est marquée PAX_VERSION_UNUSED sur place, son emplacement restant réutilisable
+ * par INSERT.
+ *
+ * Renvoie true si la page a été modifiée (pour rejouer le WAL plus bas).
+ */
+static bool
+pax_vacuum_page(Relation rel, Buffer buf, BlockNumber blkno,
+                const VacuumParams *params, double *tups_vacuumed,
+                double *tups_recently_dead, bool *page_all_unused)
+{
+    Page            page;
+    PaxPageHeader  *phdr;
+    GenericXLogState *wal_state;
+    PaxTupleMetaData *meta;
+    int              i;
+    int              n_dead = 0;
+    int              n_recent = 0;
+    bool             changed = false;
+    bool             all_unused;
+    bool             freezing = (params->options & VACOPT_FREEZE) != 0;
+    TransactionId    oldest = GetOldestNonRemovableTransactionId(rel);
+
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    page = BufferGetPage(buf);
+
+    if (!pax_page_is_valid(page))
+    {
+        UnlockReleaseBuffer(buf);
+        elog(ERROR, "pax: invalid page %u while vacuuming", blkno);
+    }
+
+    phdr = PaxPageHeaderPtr(page);
+
+    if (phdr->n_tuples == 0)
+    {
+        *page_all_unused = true;
+        UnlockReleaseBuffer(buf);
+        return false;
+    }
+
+    wal_state = GenericXLogStart(rel);
+    page = GenericXLogRegisterBuffer(wal_state, buf, 0);
+    phdr = PaxPageHeaderPtr(page);
+
+    meta = (PaxTupleMetaData *) ((char *) page + phdr->meta_offset);
+    all_unused = true;
+
+    for (i = 0; i < phdr->n_tuples; i++)
+    {
+        PaxTupleMetaData *m = &meta[i];
+
+        if (pax_meta_is_unused(m))
+            continue;
+
+        switch (pax_meta_classify(m))
+        {
+            case PAX_VERSION_RECENT:
+                /*
+                 * Transaction en cours : la version reste, et ne compte pas
+                 * comme morte.
+                 */
+                all_unused = false;
+                n_recent++;
+                continue;
+
+            case PAX_VERSION_LIVE:
+                all_unused = false;
+
+                /*
+                 * Gel. Une version dont xmin est validé et antérieur au plus
+                 * vieux xmin encore actif ne peut plus être vue par personne :
+                 * on la fige. Le champ existe déjà en page, la taille sur
+                 * disque ne change pas.
+                 */
+                if (freezing &&
+                    TransactionIdIsValid(m->xmin) &&
+                    m->xmin != FrozenTransactionId &&
+                    TransactionIdDidCommit(m->xmin) &&
+                    TransactionIdPrecedes(m->xmin, oldest))
+                {
+                    m->xmin = FrozenTransactionId;
+                    changed = true;
+                }
+                continue;
+
+            case PAX_VERSION_DEAD:
+                break;
+        }
+
+        /*
+         * Version morte. Un verrou de ligne encore actif peut empêcher un
+         * lectureur de suivre la chaîne : on ne marque pas alors.
+         */
+        if (pax_meta_has_live_locker(m))
+        {
+            all_unused = false;
+            n_recent++;
+            continue;
+        }
+
+        if (m->locker_mxid != InvalidMultiXactId)
+        {
+            /* Plus aucun membre actif : on lâche la référence au MultiXact. */
+            m->locker_mxid = InvalidMultiXactId;
+        }
+        m->flags |= PAX_VERSION_UNUSED;
+        changed = true;
+        n_dead++;
+    }
+
+    if (changed)
+    {
+        phdr->free_space = (uint16) pax_page_free_space(page);
+        GenericXLogFinish(wal_state);
+    }
+    else
+        GenericXLogAbort(wal_state);
+
+    UnlockReleaseBuffer(buf);
+
+    *page_all_unused = all_unused;
+    *tups_vacuumed += n_dead;
+    *tups_recently_dead += n_recent;
+
+    return changed;
+}
+
 static void
 pax_relation_vacuum(Relation rel, const VacuumParams *params,
                      BufferAccessStrategy bstrategy)
 {
-    pax_report_unsupported("VACUUM");
+    BufferAccessStrategy strat = bstrategy;
+    BlockNumber  nblocks;
+    BlockNumber  blkno;
+    BlockNumber  nkept = 0;
+    double       tups_vacuumed = 0;
+    double       tups_recently_dead = 0;
+
+    nblocks = RelationGetNumberOfBlocks(rel);
+
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        Buffer buf;
+        bool   all_unused;
+
+        CHECK_FOR_INTERRUPTS();
+
+        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, strat);
+        (void) pax_vacuum_page(rel, buf, blkno, params,
+                               &tups_vacuumed, &tups_recently_dead,
+                               &all_unused);
+
+        if (all_unused)
+            nkept = blkno;       /* encore traçable jusqu'ici */
+        else
+            nkept = blkno + 1;   /* cette page reste utilisée */
+    }
+
+    /*
+     * Troncature des pages finales entièrement inutilisées.
+     *
+     * Comme heap, on exige AccessExclusiveLock : entre le nettoyage et la
+     * troncature, un inserter a pu ajouter des lignes sur ces pages.
+     */
+    if (nkept < nblocks)
+    {
+        BlockNumber new_rel_pages = nkept;
+
+        if (!ConditionalLockRelation(rel, AccessExclusiveLock))
+        {
+            UnlockRelation(rel, AccessExclusiveLock);
+            goto out;
+        }
+
+        /*
+         * Reverifier depuis la fin : le nombre de pages a pu changer, et des
+         * lignes ont pu être insérées pendant le nettoyage.
+         */
+        while (new_rel_pages > 0)
+        {
+            Buffer buf;
+            Page   page;
+            PaxPageHeader *phdr;
+            bool   empty;
+            int    i;
+            int    n_tuples;
+
+            CHECK_FOR_INTERRUPTS();
+
+            buf = ReadBufferExtended(rel, MAIN_FORKNUM, new_rel_pages - 1,
+                                      RBM_NORMAL, NULL);
+            LockBuffer(buf, BUFFER_LOCK_SHARE);
+            page = BufferGetPage(buf);
+
+            if (!pax_page_is_valid(page))
+            {
+                UnlockReleaseBuffer(buf);
+                break;
+            }
+
+            phdr = PaxPageHeaderPtr(page);
+            n_tuples = phdr->n_tuples;
+            empty = true;
+
+            for (i = 0; i < n_tuples; i++)
+            {
+                PaxTupleMetaData *m;
+
+                m = ((PaxTupleMetaData *)
+                     ((char *) page + phdr->meta_offset)) + i;
+                if (!pax_meta_is_unused(m))
+                {
+                    empty = false;
+                    break;
+                }
+            }
+            UnlockReleaseBuffer(buf);
+
+            if (!empty)
+                break;
+            new_rel_pages--;
+        }
+
+        if (new_rel_pages < RelationGetNumberOfBlocks(rel))
+        {
+            /* Les entrées FSM des pages retirées ne désignent plus rien. */
+            BlockNumber b;
+
+            for (b = new_rel_pages; b < nblocks; b++)
+                RecordPageWithFreeSpace(rel, b, 0);
+
+            RelationTruncate(rel, new_rel_pages);
+        }
+        UnlockRelation(rel, AccessExclusiveLock);
+    }
+
+out:
+    /* Le FSM est renseigné à l'insertion ; on le remet à jour. */
+
+    /* Le FSM est renseigne à l'insertion ; on le remet a jour. */
+    for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
+    {
+        Buffer buf;
+        Size   free_space;
+
+        buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, strat);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        free_space = pax_page_free_space(BufferGetPage(buf));
+        UnlockReleaseBuffer(buf);
+
+        RecordPageWithFreeSpace(rel, blkno, free_space);
+    }
+
 }
 
+/*
+ * ANALYZE. La boucle externe choisit les pages via le read stream, la boucle
+ * interne les parcourt. Le verrou de contenu est tenu pendant toute la page :
+ * un inserter ne peut donc pas y faire de memmove, et la mise en page reste
+ * valide d'un tuple au suivant.
+ */
 static bool
 pax_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
-    pax_report_unsupported("ANALYZE table scans");
-    return false;
+    PaxScanDesc  sdesc = (PaxScanDesc) scan;
+    Relation     rel = scan->rs_rd;
+    TupleDesc    tupdesc = RelationGetDescr(rel);
+    Buffer       buf;
+    Page         page;
+    PaxPageDesc *desc;
+
+    CHECK_FOR_INTERRUPTS();
+
+    buf = read_stream_next_buffer(stream, NULL);
+    if (!BufferIsValid(buf))
+    {
+        sdesc->analyze_done = true;
+        return false;
+    }
+
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buf);
+
+    /*
+     * Une page vide ou non initialisée n'a rien à échantillonner : on la
+     * saute, sans erreur, comme heap le fait pour une page sans line pointer.
+     * Le contrat autorise à renvoyer false pour un bloc non échantillonnable.
+     */
+    if (!pax_page_is_valid(page))
+    {
+        UnlockReleaseBuffer(buf);
+        return false;
+    }
+
+    sdesc->current_buf = buf;
+    sdesc->current_block = BufferGetBlockNumber(buf);
+    sdesc->current_tupno = -1;
+    sdesc->analyze_done = false;
+
+    pax_scan_drop_cached_desc(sdesc);
+    desc = pax_scan_page_desc(sdesc, page, sdesc->current_block, tupdesc);
+
+    /* Une page sans version n'a rien à échantillonner. */
+    if (desc->n_tuples == 0)
+        sdesc->analyze_done = true;
+
+    return true;
 }
 
 static bool
 pax_scan_analyze_next_tuple(TableScanDesc scan, double *liverows,
                             double *deadrows, TupleTableSlot *slot)
 {
-    pax_report_unsupported("ANALYZE table scans");
+    PaxScanDesc sdesc = (PaxScanDesc) scan;
+    Relation    rel = scan->rs_rd;
+    TupleDesc   tupdesc = RelationGetDescr(rel);
+
+    while (!sdesc->analyze_done)
+    {
+        Page         page;
+        PaxPageDesc *desc;
+        int          tupno;
+        PaxVersionState state;
+
+        page = BufferGetPage(sdesc->current_buf);
+        desc = pax_scan_page_desc(sdesc, page, sdesc->current_block, tupdesc);
+
+        tupno = pax_find_visible_tuple(sdesc, desc,
+                                       sdesc->current_tupno + 1);
+
+        /*
+         * pax_find_visible_tuple filtre sur le snapshot du scan, qui est
+         * SnapshotAny pour une analyse : il ne fait donc ici que sauter les
+         * versions inutilisées. Le décompte mort/vivant est fait séparément.
+         */
+        if (tupno < 0)
+        {
+            sdesc->analyze_done = true;
+            break;
+        }
+
+        sdesc->current_tupno = tupno;
+        state = pax_meta_classify(&desc->tuple_meta[tupno]);
+
+        switch (state)
+        {
+            case PAX_VERSION_LIVE:
+                *liverows += 1;
+                pax_store_tuple_slot(rel, slot, sdesc->current_buf, desc,
+                                     tupno, false);
+                ExecMaterializeSlot(slot);
+                return true;
+
+            case PAX_VERSION_DEAD:
+                *deadrows += 1;
+                break;
+
+            case PAX_VERSION_RECENT:
+            default:
+                /*
+                 * Ligne en cours d'insertion ou de suppression : ni comptée
+                 * comme morte (elle ne l'est pas encore), ni échantillonnée,
+                 * comme le fait heap pour INSERT_IN_PROGRESS.
+                 */
+                break;
+        }
+    }
+
+    /* Page épuisée : on rend le tampon, la boucle externe prend la suite. */
+    LockBuffer(sdesc->current_buf, BUFFER_LOCK_UNLOCK);
+    pax_scan_unpin_current(sdesc);
+    sdesc->current_tupno = -1;
+    pax_scan_drop_cached_desc(sdesc);
+
     return false;
 }
 
@@ -1060,9 +1518,11 @@ pax_refresh_tuple_meta(PaxPageDesc *desc, Page page)
         if (!ItemPointerIsValid(&meta->t_ctid) ||
             !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
             elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
-        if (meta->flags != 0)
-            elog(ERROR, "pax: tuple %d has unknown metadata flags %#x",
-                 i, meta->flags);
+        if ((meta->flags & ~PAX_VERSION_UNUSED) != 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("pax: tuple %d has unknown metadata flags %#x",
+                            i, (int) meta->flags)));
         if (meta->reserved2 != 0)
             elog(ERROR, "pax: tuple %d has nonzero metadata padding", i);
     }
@@ -1493,6 +1953,18 @@ pax_meta_xmin_visible(const PaxTupleMetaData *meta, Snapshot snapshot)
 static bool
 pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta, Snapshot snapshot)
 {
+    /*
+     * Version marked UNUSED by VACUUM: invisible to everyone, always.
+     *
+     * This is the single choke point for visibility, so making it here covers
+     * the sequential scan, the TID fetches, and both chain followers
+     * (pax_get_latest_tuple and the FIND_LAST_VERSION path in tuple_lock).
+     * A stale t_ctid therefore lands on an invisible version and the chain
+     * stops, instead of exposing a version that was reclaimed.
+     */
+    if (pax_meta_is_unused(meta))
+        return false;
+
     if (!pax_meta_xmin_visible(meta, snapshot))
         return false;
 
@@ -1530,6 +2002,20 @@ pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc, int start)
     for (tupno = start; tupno < pdesc->n_tuples; tupno++)
     {
         CHECK_FOR_INTERRUPTS();
+
+        /* Une version marquée inutilisée par VACUUM n'existe plus. */
+        if (pax_meta_is_unused(&pdesc->tuple_meta[tupno]))
+            continue;
+
+        /*
+         * ANALYZE n'a pas de snapshot (table_beginscan_analyze passe NULL) :
+         * on ne filtre alors que les versions inutilisées, et c'est
+         * pax_meta_classify() qui décide ensuite si la version est vivante ou
+         * morte. Un scan normal a toujours un snapshot.
+         */
+        if (scan->rs_base.rs_snapshot == NULL)
+            return tupno;
+
         if (pax_meta_satisfies_snapshot(&pdesc->tuple_meta[tupno],
                                         scan->rs_base.rs_snapshot))
             return tupno;
@@ -1545,6 +2031,18 @@ pax_store_tuple_slot(Relation rel, TupleTableSlot *slot, Buffer buffer,
                      PaxPageDesc *pdesc, int tupno, bool owns_pdesc)
 {
     PaxTupleTableSlot *pslot = (PaxTupleTableSlot *) slot;
+
+    /*
+     * The slot may still hold a previously materialized tuple. A regular scan
+     * clears it between rows, but ANALYZE does not: it calls this callback
+     * again while the slot still carries TTS_FLAG_SHOULDFREE.
+     *
+     * Without this reset, the flag would stay set while tts_values[] points
+     * back into the page, and pax_slot_clear() would then pfree() a page
+     * pointer. Clear the old contents first.
+     */
+    if (slot->tts_flags & TTS_FLAG_SHOULDFREE)
+        pax_slot_clear(slot);
 
     pslot->buffer = buffer;
     IncrBufferRefCount(buffer);
@@ -1864,9 +2362,8 @@ pax_scan_begin(Relation rel, Snapshot snapshot,
     PaxScanDesc scan;
 
     (void) key;
-    if ((flags & SO_TYPE_SEQSCAN) == 0 &&
-        (flags & SO_TYPE_TIDSCAN) == 0 &&
-        (flags & SO_TYPE_TIDRANGESCAN) == 0)
+    if ((flags & (SO_TYPE_SEQSCAN | SO_TYPE_TIDSCAN |
+                  SO_TYPE_TIDRANGESCAN | SO_TYPE_ANALYZE)) == 0)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("pax table AM supports only sequential and TID table scans")));
@@ -2889,6 +3386,14 @@ static PaxVersionStatus
 pax_classify_version(const PaxTupleMetaData *meta,
                      const ItemPointerData *self_tid, CommandId cid)
 {
+    /*
+     * Version reclaimed by VACUUM: treat it as deleted so that a chain walk
+     * stops here rather than following its t_ctid. Its offset stays valid, so
+     * a stale inbound link resolves to this version and to nothing beyond.
+     */
+    if (pax_meta_is_unused(meta))
+        return PaxVersionDeleted;
+
     if (TransactionIdIsCurrentTransactionId(meta->xmin))
     {
         if (meta->cmin >= cid)
