@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1180" viewBox="0 0 1000 1180" font-family="'DejaVu Sans',Helvetica,Arial,sans-serif">
+<title>Page PAX v3 réelle — ventes bloc 0</title>
+<style>.t{font-size:19px;font-weight:600;fill:#1b2733}.s{font-size:12px;fill:#5b6b7c}.b{font-size:12.5px;font-weight:600;fill:#1b2733}.l{font-size:11.5px;fill:#1b2733}.m{font-family:'DejaVu Sans Mono',Menlo,monospace}.z{font-size:9.5px;fill:#45566a}.zr{font-size:9.5px;fill:#45566a;text-anchor:end}.n{font-size:11px;fill:#45566a}.nb{font-size:12px;fill:#1b2733;font-weight:600}.f{stroke:#33475b;stroke-width:2}</style>
+<rect width="1000" height="1180" fill="#fff"/>
+<text class="t" x="24" y="36">Page PAX v3 réelle — bloc 0 de ventes</text>
+<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont lues, pas estimées.</text>
+<rect class="f" x="120" y="82" width="470" height="62" fill="#dbe4ee"/>
+<text class="b" x="134" y="100">PageHeaderData</text>
+<text class="zr" x="576" y="100" text-anchor="end">24 o — offset 0</text>
+<text class="z m" x="134" y="116">pd_lsn 0x38FC365800000000 · pd_checksum 25531 · pd_flags 0</text>
+<text class="z m" x="134" y="130">pd_lower <tspan font-weight='600'>6480</tspan> · pd_upper <tspan font-weight='600'>6520</tspan> · pd_special 8184</text>
+<rect class="f" x="120" y="144" width="470" height="20" fill="#eef2f6" stroke-dasharray="4 2"/>
+<text class="z" x="134" y="158">padding d'alignement — PaxPageHeaderPtr = page + 24 + 8</text>
+<text class="zr" x="576" y="158" text-anchor="end">8 o — offset 24</text>
+<rect class="f" x="120" y="164" width="470" height="58" fill="#c9dcea"/>
+<text class="b" x="134" y="182">PaxPageHeader</text>
+<text class="zr" x="576" y="182" text-anchor="end">16 o — offset 32</text>
+<text class="z m" x="134" y="197">n_tuples <tspan font-weight='600'>114</tspan> · meta_offset <tspan font-weight='600'>48</tspan> · free_space 40 · flags 0x0018</text>
+<text class="z m" x="134" y="211">offsets[0]=3696  offsets[1]=4624  offsets[2]=5552</text>
+<rect class="f" x="120" y="222" width="470" height="134" fill="#f6cdd2"/>
+<text class="b" x="134" y="240">Région de métadonnées</text>
+<text class="zr" x="576" y="240" text-anchor="end">114 × 32 = 3648 o</text>
+<text class="z m" x="134" y="254">offsets [0..3647] — une PaxTupleMetaData par version</text>
+<rect x="134" y="262" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<text class="z m" x="140" y="273">v0  xmin 4472  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<rect x="134" y="278" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<text class="z m" x="140" y="289">v1  xmin 4472  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<rect x="134" y="294" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<text class="z m" x="140" y="305">v2  xmin 4472  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<rect x="134" y="310" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<text class="z m" x="140" y="321">v3  xmin 4472  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<rect x="134" y="326" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<text class="z m" x="140" y="337">v4  xmin 4472  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z" x="140" y="346">… 109 versions supplémentaires</text>
+<rect class="f" x="120" y="356" width="470" height="88" fill="#cfe3d3"/>
+<text class="b" x="134" y="374">Région colonne 0 — id (int4)</text>
+<text class="zr" x="576" y="374" text-anchor="end">[3696, 4624) = 928 o</text>
+<text class="z m" x="134" y="389">bitmap de NULL : 16 o   +   114 slots × 8 o = 912 o   →   0 NULL</text>
+<rect x="134" y="394" width="442" height="14" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
+<text class="z m" x="140" y="405">slots de 8 o (valeur 4 o + align)</text>
+<rect x="134" y="409" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
+<text class="z m" x="140" y="420">premières valeurs : 1, 2, 3, 4, 5   … (109 de plus)</text>
+<rect class="f" x="120" y="444" width="470" height="88" fill="#d9d6ea"/>
+<text class="b" x="134" y="462">Région colonne 1 — nom (varlena)</text>
+<text class="zr" x="576" y="462" text-anchor="end">[4624, 5552) = 928 o</text>
+<text class="z m" x="134" y="477">bitmap de NULL : 16 o   +   114 slots × 8 o = 912 o   →   10 NULL</text>
+<rect x="134" y="482" width="442" height="14" fill="#c6c2dd" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="493">slots de 2 o = offset ABSOLU de la valeur en haut de page</text>
+<rect x="134" y="497" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
+<text class="z m" x="140" y="508">premières valeurs : client-1, client-2, client-3, client-4, client-5   … (109 de plus)</text>
+<rect class="f" x="120" y="532" width="470" height="88" fill="#cfe3d3"/>
+<text class="b" x="134" y="550">Région colonne 2 — quantite (int4)</text>
+<text class="zr" x="576" y="550" text-anchor="end">[5552, 6480) = 928 o</text>
+<text class="z m" x="134" y="565">bitmap de NULL : 16 o   +   114 slots × 8 o = 912 o   →   16 NULL</text>
+<rect x="134" y="570" width="442" height="14" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
+<text class="z m" x="140" y="581">slots de 8 o (valeur 4 o + align)</text>
+<rect x="134" y="585" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
+<text class="z m" x="140" y="596">premières valeurs : 3, 6, 9, 12, 15   … (109 de plus)</text>
+<rect class="f" x="120" y="620" width="470" height="52" fill="#f4f6f8" stroke-dasharray="5 3"/>
+<text class="l" x="134" y="640">Espace libre</text>
+<text class="zr" x="576" y="640" text-anchor="end">[6480, 6520) = 40 o</text>
+<text class="z" x="134" y="657">page à 78.8 % occupée — first-fit n'a plus de place pour une ligne</text>
+<rect class="f" x="120" y="672" width="470" height="104" fill="#e4ddf0"/>
+<text class="b" x="134" y="690">Valeurs varlena</text>
+<text class="zr" x="576" y="690" text-anchor="end">[6520, 8184) = 1664 o</text>
+<text class="z m" x="134" y="704">pd_upper descend à chaque allocation — 104 valeurs référencées</text>
+<rect x="134" y="710" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="721">@8168  « client-1 »  varlena 16 o</text>
+<rect x="134" y="726" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="737">@8152  « client-2 »  varlena 16 o</text>
+<rect x="134" y="742" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="753">@8136  « client-3 »  varlena 16 o</text>
+<rect x="134" y="758" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="769">@8120  « client-4 »  varlena 16 o</text>
+<rect class="f" x="120" y="776" width="470" height="48" fill="#f0dcef"/>
+<text class="b" x="134" y="795">PaxSpecialData</text>
+<text class="zr" x="576" y="795" text-anchor="end">8 o — offset 8184</text>
+<text class="z m" x="134" y="811">version 3 · magic 0x5041 · n_attrs 3 · flags 0x0018</text>
+</svg>

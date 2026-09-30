@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="800" viewBox="0 0 820 800"
+     font-family="'DejaVu Sans','Helvetica Neue',Helvetica,Arial,sans-serif">
+  <title>Disposition d'une page heap PostgreSQL</title>
+  <desc>Page 8 ko : PageHeaderData, tableau de line pointers croissant vers le haut,
+        espace libre, tuples décroissant depuis pd_upper, espace special.</desc>
+
+  <defs>
+    <style>
+      .t      { font-size: 18px; font-weight: 600; fill: #1b2733; }
+      .sub    { font-size: 12px; fill: #5b6b7c; }
+      .lbl    { font-size: 12px; fill: #1b2733; }
+      .lblb   { font-size: 12px; font-weight: 600; fill: #1b2733; }
+      .mono   { font-family:'DejaVu Sans Mono',Menlo,Consolas,monospace; }
+      .tiny   { font-size: 10px; fill: #7a8898; }
+      .sz     { font-size: 9.5px; fill: #45566a; }
+      .szr    { font-size: 9.5px; fill: #45566a; text-anchor: end; }
+      .ptr    { font-size: 11px; fill: #b4531f; font-weight: 700; }
+      .ptrt   { font-size: 9.5px; fill: #b4531f; }
+      .note   { font-size: 11px; fill: #45566a; }
+      .noteb  { font-size: 12px; fill: #1b2733; font-weight: 600; }
+      .frame  { stroke: #33475b; stroke-width: 2; }
+    </style>
+    <marker id="arO" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto">
+      <path d="M0,0 L6,2.5 L0,5 z" fill="#b4531f"/>
+    </marker>
+  </defs>
+
+  <rect width="820" height="800" fill="#ffffff"/>
+  <text class="t" x="24" y="34">Page heap — disposition classique PostgreSQL</text>
+  <text class="sub" x="24" y="55">BLCKSZ = 8192 o · chaque tuple porte son propre en-tête et ses propres données</text>
+
+  <!-- ============ PAGE ============ -->
+  <g>
+    <!-- 1. PageHeaderData -->
+    <rect class="frame" x="90" y="76" width="360" height="64" fill="#dbe4ee"/>
+    <text class="lblb" x="102" y="94">PageHeaderData</text>
+    <text class="sz mono" x="102" y="110">pd_lsn 8 · pd_checksum 2 · pd_flags 2</text>
+    <text class="sz mono" x="102" y="124">pd_lower 2 · pd_upper 2 · pd_special 2</text>
+    <text class="sz mono" x="102" y="136">pd_pagesize_version 2 · pd_prune_xid 4</text>
+    <text class="szr mono" text-anchor="end" x="438" y="110">24 o</text>
+
+    <!-- 2. Line pointers -->
+    <rect class="frame" x="90" y="140" width="360" height="100" fill="#fbe6bd"/>
+    <text class="lblb" x="102" y="159">Line pointers (ItemIdData)</text>
+    <text class="sz" x="102" y="173">4 o chacun, empilés vers le haut de la page</text>
+    <rect x="102" y="180" width="336" height="13" fill="#f7d9a0" stroke="#c9a24d" stroke-width="1"/>
+    <rect x="102" y="196" width="336" height="13" fill="#f7d9a0" stroke="#c9a24d" stroke-width="1"/>
+    <rect x="102" y="212" width="336" height="13" fill="#f7d9a0" stroke="#c9a24d" stroke-width="1"/>
+    <rect x="102" y="228" width="336" height="9" fill="#f7d9a0" stroke="#c9a24d" stroke-width="1"/>
+    <text class="szr mono" text-anchor="end" x="438" y="200">4 × 4 = 16 o</text>
+
+    <!-- 3. Free space -->
+    <rect class="frame" x="90" y="240" width="360" height="132" fill="#f4f6f8" stroke-dasharray="5 3"/>
+    <text class="lbl" x="102" y="264">Espace libre</text>
+    <text class="sz" x="102" y="280">fragmentable</text>
+    <text class="szr mono" text-anchor="end" x="438" y="264" fill="#8a97a5">pd_upper − pd_lower</text>
+
+    <!-- 4. Tuple 1 -->
+    <rect class="frame" x="90" y="372" width="360" height="152" fill="#cfe9d4"/>
+    <text class="lblb" x="102" y="391">Tuple 1 — autoporteur</text>
+    <text class="szr mono" text-anchor="end" x="438" y="391">≈ 88 o</text>
+
+    <rect x="102" y="398" width="336" height="38" fill="#a8d5b5" stroke="#6aa878" stroke-width="1"/>
+    <text class="sz mono" x="109" y="412">HeapTupleHeader 23 o + align → 24 o</text>
+    <text class="sz mono" x="109" y="427">t_xmin t_xmax t_cid t_ctid t_infomask2 t_infomask t_hoff</text>
+
+    <rect x="102" y="440" width="336" height="20" fill="#bfe0c9" stroke="#6aa878" stroke-width="1"/>
+    <text class="sz mono" x="109" y="454">bitmap de NULL (1 o → align 8 o)</text>
+
+    <rect x="102" y="464" width="110" height="20" fill="#a2d3b0" stroke="#6aa878" stroke-width="1"/>
+    <text class="sz mono" x="109" y="478">id  4 o</text>
+    <rect x="216" y="464" width="222" height="20" fill="#a2d3b0" stroke="#6aa878" stroke-width="1"/>
+    <text class="sz mono" x="223" y="478">payload « abc » varlena 15 o</text>
+
+    <rect x="102" y="488" width="336" height="28" fill="#e4f2e8" stroke="#6aa878" stroke-width="1" stroke-dasharray="3 2"/>
+    <text class="sz mono" x="109" y="506">espace libre interne (alignement t_hoff)</text>
+
+    <!-- 5. Tuple 2 -->
+    <rect class="frame" x="90" y="524" width="360" height="58" fill="#cfe9d4"/>
+    <text class="lblb" x="102" y="543">Tuple 2</text>
+    <text class="szr mono" text-anchor="end" x="438" y="543">≈ 72 o</text>
+    <text class="sz mono" x="102" y="559">en-tête 24 o + NULL 8 o + id 4 o + payload</text>
+    <text class="sz" x="102" y="574">même structure, dupliquée à chaque ligne</text>
+
+    <!-- 6. special -->
+    <rect class="frame" x="90" y="582" width="360" height="38" fill="#e8ddf5" stroke-dasharray="5 3"/>
+    <text class="lbl" x="102" y="606">Espace spécial</text>
+    <text class="sz" x="200" y="606">vide pour heap : pd_special = pd_upper</text>
+    <text class="szr mono" text-anchor="end" x="438" y="606">0 o</text>
+  </g>
+
+  <!-- ============ POINTEURS ============ -->
+  <g>
+    <path d="M86,240 L66,240" stroke="#b4531f" stroke-width="1.5" marker-end="url(#arO)"/>
+    <text class="ptr" x="24" y="232">pd_lower</text>
+    <text class="ptrt" x="24" y="252">fin des</text>
+    <text class="ptrt" x="24" y="264">line pointers</text>
+
+    <path d="M86,372 L66,372" stroke="#b4531f" stroke-width="1.5" marker-end="url(#arO)"/>
+    <text class="ptr" x="24" y="364">pd_upper</text>
+    <text class="ptrt" x="24" y="384">début des</text>
+    <text class="ptrt" x="24" y="396">tuples</text>
+  </g>
+
+  <!-- ============ ANNOTATIONS ============ -->
+  <g transform="translate(486,76)">
+    <text class="noteb" x="0" y="12">Points clés</text>
+    <line x1="0" y1="22" x2="290" y2="22" stroke="#dde5ec"/>
+
+    <text class="note" x="0" y="44">• <tspan font-weight="600">Un line pointer par tuple</tspan></text>
+    <text class="note" x="12" y="60">(4 o : offset, longueur,</text>
+    <text class="note" x="12" y="76">flags) empilé en bas de</text>
+    <text class="note" x="12" y="92">l'espace d'en-tête.</text>
+
+    <text class="note" x="0" y="124">• <tspan font-weight="600">Le line pointer ne stocke</tspan></text>
+    <text class="note" x="12" y="140">que la position : le contenu</text>
+    <text class="note" x="12" y="156">est relu sur la page à chaque</text>
+    <text class="note" x="12" y="172">accès.</text>
+
+    <text class="note" x="0" y="204">• <tspan font-weight="600">pd_lower monte,</tspan></text>
+    <text class="note" x="12" y="220"><tspan font-weight="600">pd_upper descend</tspan> : les deux</text>
+    <text class="note" x="12" y="236">fronts se rejoignent quand</text>
+    <text class="note" x="12" y="252">la page est pleine.</text>
+
+    <text class="note" x="0" y="284">• <tspan font-weight="600">En-tête dupliqué</tspan> dans</text>
+    <text class="note" x="12" y="300">chaque tuple (xmin, xmax,</text>
+    <text class="note" x="12" y="316">ctid…) : coût et alignement</text>
+    <text class="note" x="12" y="332">répétés à chaque ligne.</text>
+
+    <text class="note" x="0" y="364">• Un tuple ne peut pas</text>
+    <text class="note" x="12" y="380">traverser une page : au-delà,</text>
+    <text class="note" x="12" y="396">recours à TOAST.</text>
+  </g>
+
+  <!-- ============ LÉGENDE ============ -->
+  <g transform="translate(24,652)">
+    <rect width="772" height="124" rx="8" fill="#f7f9fb" stroke="#dde5ec"/>
+    <text class="noteb" x="16" y="26">Sens de croissance dans la page</text>
+    <text class="note" x="16" y="48">▲ line pointers, pd_lower augmente</text>
+    <text class="note" x="430" y="48">▼ tuples puis valeurs varlena, pd_upper diminue</text>
+    <text class="noteb" x="16" y="76">Ce qu'il faut retenir</text>
+    <text class="note" x="16" y="96">La structure est par ligne : pour lire une colonne, PostgreSQL doit parcourir tous les tuples,</text>
+    <text class="note" x="16" y="112">ouvrir chaque en-tête, et sauter d'attribut en attribut à l'intérieur de chaque tuple.</text>
+  </g>
+</svg>

@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="900" viewBox="0 0 820 900"
+     font-family="'DejaVu Sans','Helvetica Neue',Helvetica,Arial,sans-serif">
+  <title>Disposition d'une page PAX v3 (pax_am)</title>
+  <desc>Page 8 ko : PageHeaderData, padding d'alignement, PaxPageHeader, région de
+        métadonnées de 32 octets par version, une région par colonne, valeurs varlena
+        en haut de page, PaxSpecialData en bas.</desc>
+
+  <defs>
+    <style>
+      .t      { font-size: 18px; font-weight: 600; fill: #1b2733; }
+      .sub    { font-size: 12px; fill: #5b6b7c; }
+      .lbl    { font-size: 12px; fill: #1b2733; }
+      .lblb   { font-size: 12px; font-weight: 600; fill: #1b2733; }
+      .mono   { font-family:'DejaVu Sans Mono',Menlo,Consolas,monospace; }
+      .tiny   { font-size: 10px; fill: #7a8898; }
+      .sz     { font-size: 9.5px; fill: #45566a; }
+      .szr    { font-size: 9.5px; fill: #45566a; }
+      .ptr    { font-size: 11px; fill: #b4531f; font-weight: 700; }
+      .ptrt   { font-size: 9.5px; fill: #b4531f; }
+      .note   { font-size: 11px; fill: #45566a; }
+      .noteb  { font-size: 12px; fill: #1b2733; font-weight: 600; }
+      .frame  { stroke: #33475b; stroke-width: 2; }
+    </style>
+    <marker id="arO" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto">
+      <path d="M0,0 L6,2.5 L0,5 z" fill="#b4531f"/>
+    </marker>
+  </defs>
+
+  <rect width="820" height="900" fill="#ffffff"/>
+  <text class="t" x="24" y="34">Page PAX v3 — disposition columnaire (pax_am)</text>
+  <text class="sub" x="24" y="55">BLCKSZ = 8192 o · aucun line pointer · métadonnées et valeurs regroupées par colonne</text>
+
+  <!-- ============ PAGE ============ -->
+  <g>
+    <!-- 1. PageHeaderData -->
+    <rect class="frame" x="90" y="76" width="360" height="58" fill="#dbe4ee"/>
+    <text class="lblb" x="102" y="93">PageHeaderData</text>
+    <text class="szr mono" x="438" y="93" text-anchor="end">24 o</text>
+    <text class="sz mono" x="102" y="109">pd_lsn 8 · pd_checksum 2 · pd_flags 2 · pd_lower 2</text>
+    <text class="sz mono" x="102" y="124">pd_upper 2 · pd_special 2 · pagesize_ver 2 · prune_xid 4</text>
+
+    <!-- 2. padding -->
+    <rect class="frame" x="90" y="134" width="360" height="20" fill="#eef2f6" stroke-dasharray="4 2"/>
+    <text class="tiny" x="102" y="148">padding — aligne PaxPageHeader sur 8 octets</text>
+    <text class="szr mono" x="438" y="148" text-anchor="end">8 o</text>
+
+    <!-- 3. PaxPageHeader -->
+    <rect class="frame" x="90" y="154" width="360" height="66" fill="#c9dcea"/>
+    <text class="lblb" x="102" y="172">PaxPageHeader</text>
+    <text class="szr mono" x="438" y="172" text-anchor="end">16 o</text>
+    <text class="sz mono" x="102" y="188">n_tuples 2 · meta_offset 2 · free_space 2 · flags 2</text>
+    <text class="sz mono" x="102" y="202">offsets[n_attrs] : 2 o par colonne</text>
+    <text class="sz" x="102" y="216">offset ABSOLU en octets — 0xFFFF si jamais écrite</text>
+
+    <!-- 4. metadonnees -->
+    <rect class="frame" x="90" y="220" width="360" height="134" fill="#f6cdd2"/>
+    <text class="lblb" x="102" y="238">Région de métadonnées</text>
+    <text class="szr mono" x="438" y="238" text-anchor="end">4 × 32 = 128 o</text>
+    <text class="sz mono" x="102" y="253">xmin 4 · xmax 4 · cmin 4 · cmax 4</text>
+    <text class="sz mono" x="102" y="265">t_ctid 6 · flags 2 · locker_mxid 4 · pad 4</text>
+    <rect x="102" y="271" width="336" height="17" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+    <text class="sz mono" x="109" y="283">version 1</text>
+    <text class="sz mono" x="240" y="283">t_ctid → version 2</text>
+    <rect x="102" y="290" width="336" height="17" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+    <text class="sz mono" x="109" y="302">version 2</text>
+    <text class="sz mono" x="240" y="302">t_ctid → version 3</text>
+    <rect x="102" y="309" width="336" height="17" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+    <text class="sz mono" x="109" y="321">version 3</text>
+    <text class="sz mono" x="240" y="321">t_ctid → version 4</text>
+    <rect x="102" y="328" width="336" height="17" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+    <text class="sz mono" x="109" y="340">version 4</text>
+    <text class="sz mono" x="240" y="340">t_ctid → soi-même (feuille)</text>
+
+    <!-- 5. colonne 0 -->
+    <rect class="frame" x="90" y="354" width="360" height="96" fill="#cfe3d3"/>
+    <text class="lblb" x="102" y="372">Région colonne 0 — id (int4)</text>
+    <text class="szr mono" x="438" y="372" text-anchor="end">8 + 4×8 = 40 o</text>
+    <rect x="102" y="378" width="336" height="20" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
+    <text class="sz mono" x="109" y="392">bitmap de NULL (1 o → align 8 o)</text>
+    <rect x="102" y="402" width="81" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
+    <text class="sz mono" x="109" y="415">1</text>
+    <rect x="186" y="402" width="81" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
+    <text class="sz mono" x="193" y="415">2</text>
+    <rect x="270" y="402" width="81" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
+    <text class="sz mono" x="277" y="415">3</text>
+    <rect x="354" y="402" width="84" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
+    <text class="sz mono" x="361" y="415">4</text>
+    <text class="sz mono" x="102" y="436">slots 4 o alignés : stride = MAXALIGN(attlen)</text>
+
+    <!-- 6. colonne 1 -->
+    <rect class="frame" x="90" y="450" width="360" height="96" fill="#d9d6ea"/>
+    <text class="lblb" x="102" y="468">Région colonne 1 — payload (text)</text>
+    <text class="szr mono" x="438" y="468" text-anchor="end">8 + 4×8 = 40 o</text>
+    <rect x="102" y="474" width="336" height="20" fill="#c6c2dd" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="488">bitmap de NULL (1 o → align 8 o)</text>
+    <rect x="102" y="498" width="81" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="511">@8144</text>
+    <rect x="186" y="498" width="81" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="193" y="511">@8168</text>
+    <rect x="270" y="498" width="81" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="277" y="511">@8192</text>
+    <rect x="354" y="498" width="84" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="361" y="511">@8216</text>
+    <text class="sz mono" x="102" y="532">slots 2 o = offset ABSOLU de la valeur</text>
+
+    <!-- 7. espace libre -->
+    <rect class="frame" x="90" y="546" width="360" height="100" fill="#f4f6f8" stroke-dasharray="5 3"/>
+    <text class="lbl" x="102" y="570">Espace libre central</text>
+    <text class="szr mono" x="438" y="570" text-anchor="end" fill="#8a97a5">pd_upper − pd_lower</text>
+    <text class="sz" x="102" y="588">entre la fin des régions (pd_lower) et le</text>
+    <text class="sz" x="102" y="603">début des valeurs varlena (pd_upper)</text>
+    <text class="sz" x="102" y="622">recherche first-fit, sans fragmentation</text>
+
+    <!-- 8. varlena -->
+    <rect class="frame" x="90" y="646" width="360" height="126" fill="#e4ddf0"/>
+    <text class="lblb" x="102" y="664">Valeurs varlena en haut de page</text>
+    <text class="szr mono" x="438" y="664" text-anchor="end">4 × 24 = 96 o</text>
+    <text class="sz" x="102" y="679">pd_upper descend — aucun en-tête de tuple ici</text>
+    <rect x="102" y="685" width="336" height="17" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="697">« abc » 4 o en-tête varlena + 3 o, align 8 o</text>
+    <rect x="102" y="704" width="336" height="17" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="716">« def » 4 o en-tête varlena + 3 o</text>
+    <rect x="102" y="723" width="336" height="17" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="735">« ghi » 4 o en-tête varlena + 3 o</text>
+    <rect x="102" y="742" width="336" height="17" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+    <text class="sz mono" x="109" y="754">« jkl » 4 o en-tête varlena + 3 o</text>
+
+    <!-- 9. special -->
+    <rect class="frame" x="90" y="772" width="360" height="36" fill="#f0dcef"/>
+    <text class="lblb" x="102" y="795">PaxSpecialData</text>
+    <text class="sz mono" x="215" y="795">version 3 · magic 0x5041 · n_attrs</text>
+    <text class="szr mono" x="438" y="795" text-anchor="end">8 o</text>
+  </g>
+
+  <!-- ============ POINTEURS ============ -->
+  <g>
+    <path d="M86,546 L66,546" stroke="#b4531f" stroke-width="1.5" marker-end="url(#arO)"/>
+    <text class="ptr" x="24" y="538">pd_lower</text>
+    <text class="ptrt" x="24" y="558">fin des</text>
+    <text class="ptrt" x="24" y="570">régions</text>
+
+    <path d="M86,646 L66,646" stroke="#b4531f" stroke-width="1.5" marker-end="url(#arO)"/>
+    <text class="ptr" x="24" y="638">pd_upper</text>
+    <text class="ptrt" x="24" y="658">début des</text>
+    <text class="ptrt" x="24" y="670">varlena</text>
+  </g>
+
+  <!-- ============ ANNOTATIONS ============ -->
+  <g transform="translate(486,76)">
+    <text class="noteb" x="0" y="12">Points clés</text>
+    <line x1="0" y1="22" x2="290" y2="22" stroke="#dde5ec"/>
+
+    <text class="note" x="0" y="44">• <tspan font-weight="600">Aucun line pointer.</tspan></text>
+    <text class="note" x="12" y="60">L'identité d'une version est</text>
+    <text class="note" x="12" y="76">son index (t_ctid), pas un</text>
+    <text class="note" x="12" y="92">ItemIdData rangé en page.</text>
+
+    <text class="note" x="0" y="124">• <tspan font-weight="600">Métadonnées columnaires</tspan></text>
+    <text class="note" x="12" y="140">xmin, xmax, cmin, cmax,</text>
+    <text class="note" x="12" y="156">t_ctid et locker_mxid sont</text>
+    <text class="note" x="12" y="172">regroupés : 32 o par version.</text>
+
+    <text class="note" x="0" y="204">• <tspan font-weight="600">Une région par colonne,</tspan></text>
+    <text class="note" x="12" y="220">valeurs alignées colonne par</text>
+    <text class="note" x="12" y="236">colonne, avec son propre</text>
+    <text class="note" x="12" y="252">bitmap de NULL.</text>
+
+    <text class="note" x="0" y="284">• <tspan font-weight="600">Varlena déporté :</tspan> la</text>
+    <text class="note" x="12" y="300">colonne ne contient qu'un</text>
+    <text class="note" x="12" y="316">pointeur de 2 o, la donnée</text>
+    <text class="note" x="12" y="332">étant en haut de page.</text>
+
+    <text class="note" x="0" y="364">• Une colonne jamais écrite</text>
+    <text class="note" x="12" y="380">sur cette page est marquée</text>
+    <text class="note" x="12" y="396">offsets[i] = 0xFFFF.</text>
+  </g>
+
+  <!-- ============ LEGENDE ============ -->
+  <g transform="translate(24,820)">
+    <rect width="772" height="66" rx="8" fill="#f7f9fb" stroke="#dde5ec"/>
+    <text class="noteb" x="16" y="24">Sens de croissance dans la page</text>
+    <text class="note" x="16" y="44">▲ métadonnées puis régions, pd_lower augmente</text>
+    <text class="note" x="430" y="44">▼ valeurs varlena, pd_upper diminue</text>
+    <text class="note" x="16" y="60">Schéma qualitatif pour 2 colonnes et 4 versions — hauteurs non à l'échelle.</text>
+  </g>
+</svg>
