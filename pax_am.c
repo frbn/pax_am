@@ -218,6 +218,13 @@ typedef struct PaxPageDesc
     OffsetNumber    stamp_meta_offset;
     OffsetNumber   *stamp_offsets;    /* n_attrs entrées */
     int             meta_capacity;    /* versions que tuple_meta peut contenir */
+    /*
+     * Curseur de revalidation : les entrées [0, meta_checked_through) ont été
+     * copiées et validées par ce descripteur. Un balayage n'avançant que vers
+     * l'avant, elles ne seront plus relues, ce qui évite de recopier toute la
+     * région à chaque tupline retournée (cf. pax_meta_ensure).
+     */
+    int             meta_checked_through;
 } PaxPageDesc;
 
 /* ------------------------------------------------------------------ */
@@ -298,6 +305,7 @@ static bool         pax_layout_is_current(const PaxPageDesc *desc, Page page,
                                            PaxPageHeader *phdr,
                                            TupleDesc tupdesc);
 static void         pax_refresh_tuple_meta(PaxPageDesc *desc, Page page);
+static void         pax_meta_ensure(PaxPageDesc *desc, Page page, int i);
 static PaxPageDesc *pax_build_page_desc(Page page, TupleDesc tupdesc);
 static void         pax_free_page_desc(PaxPageDesc *desc);
 
@@ -1335,6 +1343,32 @@ pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
     memcpy(desc->stamp_offsets, phdr->offsets,
            sizeof(OffsetNumber) * desc->n_attrs);
 
+    /*
+     * Tampon des métadonnées de version, dimensionné une fois pour la page.
+     * Le contenu est ensuite rempli à la demande (pax_meta_ensure) ou en
+     * bloc (pax_refresh_tuple_meta), selon le chemin appelant.
+     *
+     * La taille de la région de métadonnées est une propriété de la mise en
+     * page : elle est vérifiée ici pour que le chemin paresseux en bénéficie
+     * autant que la revalidation complète.
+     */
+    if (desc->n_tuples > 0)
+    {
+        if (!PaxOffsetIsValid(phdr->meta_offset))
+            elog(ERROR, "pax: missing transaction metadata region");
+        if (pax_meta_region_size(page, phdr) !=
+            (Size) desc->n_tuples * SizeOfPaxTupleMetaData)
+            elog(ERROR, "pax: inconsistent transaction metadata region "
+                        "(region %zu, %d tuples x %zu)",
+                 pax_meta_region_size(page, phdr), desc->n_tuples,
+                 SizeOfPaxTupleMetaData);
+    }
+
+    desc->tuple_meta = (PaxTupleMetaData *)
+        palloc(SizeOfPaxTupleMetaData * (desc->n_tuples > 0 ? desc->n_tuples : 1));
+    desc->meta_capacity = desc->n_tuples;
+    desc->meta_checked_through = 0;
+
     desc->minipages = (PaxMinipage *) palloc0(sizeof(PaxMinipage) * desc->n_attrs);
 
     for (i = 0; i < desc->n_attrs; i++)
@@ -1459,6 +1493,62 @@ pax_layout_is_current(const PaxPageDesc *desc, Page page, BlockNumber blkno,
  * décision de visibilité erronée.
  */
 static void
+pax_validate_tuple_meta(const PaxTupleMetaData *meta, int i)
+{
+    if (!TransactionIdIsValid(meta->xmin))
+        elog(ERROR, "pax: tuple %d has invalid xmin", i);
+    if (meta->cmin == InvalidCommandId)
+        elog(ERROR, "pax: tuple %d has invalid cmin", i);
+    if (!TransactionIdIsValid(meta->xmax) && meta->cmax != InvalidCommandId)
+        elog(ERROR, "pax: tuple %d has cmax without xmax", i);
+    if (TransactionIdIsValid(meta->xmax) && meta->cmax == InvalidCommandId)
+        elog(ERROR, "pax: tuple %d has xmax without cmax", i);
+    if (!ItemPointerIsValid(&meta->t_ctid) ||
+        !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
+        elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
+    if ((meta->flags & ~PAX_VERSION_UNUSED) != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("pax: tuple %d has unknown metadata flags %#x",
+                        i, (int) meta->flags)));
+    if (meta->reserved2 != 0)
+        elog(ERROR, "pax: tuple %d has nonzero metadata padding", i);
+}
+
+/*
+ * S assure que l'entrée i est à jour dans desc, en la recopiant et en la
+ * validant si elle n'a pas déjà été consommée.
+ *
+ * C'est le point clé du balayage : le descripteur de page survit d'une
+ * tupline à l'autre, et recopier puis revalider les n métadonnées à chaque
+ * appel donnait un comportement O(n²) par page alors que l'on n'examine
+ * presque toujours qu'une seule entrée. Le curseur de lecture n'avance que
+ * vers l'avant, donc une entrée déjà consommée ne sera plus relue : il suffit
+ * de garantir les entrées au-delà du curseur.
+ */
+static void
+pax_meta_ensure(PaxPageDesc *desc, Page page, int i)
+{
+    PaxPageHeader      *phdr = desc->header;
+    PaxTupleMetaData   *meta;
+
+    Assert(i >= 0 && i < desc->n_tuples);
+
+    if (i < desc->meta_checked_through)
+        return;
+
+    meta = &desc->tuple_meta[i];
+    memcpy(meta,
+           (char *) page + phdr->meta_offset +
+           (Size) i * SizeOfPaxTupleMetaData,
+           SizeOfPaxTupleMetaData);
+    pax_validate_tuple_meta(meta, i);
+
+    if (i + 1 > desc->meta_checked_through)
+        desc->meta_checked_through = i + 1;
+}
+
+static void
 pax_refresh_tuple_meta(PaxPageDesc *desc, Page page)
 {
     PaxPageHeader  *phdr = desc->header;
@@ -1471,7 +1561,10 @@ pax_refresh_tuple_meta(PaxPageDesc *desc, Page page)
         desc->minipages[i].n_values = desc->n_tuples;
 
     if (desc->n_tuples == 0)
+    {
+        desc->meta_checked_through = 0;
         return;
+    }
 
     expected = (Size) desc->n_tuples * SizeOfPaxTupleMetaData;
 
@@ -1484,48 +1577,14 @@ pax_refresh_tuple_meta(PaxPageDesc *desc, Page page)
              pax_meta_region_size(page, phdr), desc->n_tuples,
              SizeOfPaxTupleMetaData);
 
-    /*
-     * Réallocation seulement si la page a gagné des versions depuis le
-     * dernier rafraîchissement. C'est le seul cas qui écrit dans ce tampon.
-     */
-    if (desc->tuple_meta == NULL || desc->n_tuples > desc->meta_capacity)
-    {
-        if (desc->tuple_meta)
-            pfree(desc->tuple_meta);
-        desc->tuple_meta = (PaxTupleMetaData *)
-            palloc(SizeOfPaxTupleMetaData * desc->n_tuples);
-        desc->meta_capacity = desc->n_tuples;
-    }
-
     memcpy(desc->tuple_meta,
            (char *) page + phdr->meta_offset,
            expected);
 
     for (i = 0; i < desc->n_tuples; i++)
-    {
-        PaxTupleMetaData *meta = &desc->tuple_meta[i];
+        pax_validate_tuple_meta(&desc->tuple_meta[i], i);
 
-        if (!TransactionIdIsValid(meta->xmin))
-            elog(ERROR, "pax: tuple %d has invalid xmin", i);
-        if (meta->cmin == InvalidCommandId)
-            elog(ERROR, "pax: tuple %d has invalid cmin", i);
-        if (!TransactionIdIsValid(meta->xmax) &&
-            meta->cmax != InvalidCommandId)
-            elog(ERROR, "pax: tuple %d has cmax without xmax", i);
-        if (TransactionIdIsValid(meta->xmax) &&
-            meta->cmax == InvalidCommandId)
-            elog(ERROR, "pax: tuple %d has xmax without cmax", i);
-        if (!ItemPointerIsValid(&meta->t_ctid) ||
-            !OffsetNumberIsValid(ItemPointerGetOffsetNumber(&meta->t_ctid)))
-            elog(ERROR, "pax: tuple %d has invalid t_ctid", i);
-        if ((meta->flags & ~PAX_VERSION_UNUSED) != 0)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATA_CORRUPTED),
-                     errmsg("pax: tuple %d has unknown metadata flags %#x",
-                            i, (int) meta->flags)));
-        if (meta->reserved2 != 0)
-            elog(ERROR, "pax: tuple %d has nonzero metadata padding", i);
-    }
+    desc->meta_checked_through = desc->n_tuples;
 }
 
 /*
@@ -2002,6 +2061,13 @@ pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc, int start)
     for (tupno = start; tupno < pdesc->n_tuples; tupno++)
     {
         CHECK_FOR_INTERRUPTS();
+
+        /*
+         * Recopie et validation à la demande. Le balayage n'avance que vers
+         * l'avant, donc les entrées déjà consommées ne sont jamais relues et ne
+         * seraient qu'un coût O(n²) si on les revalidait à chaque appel.
+         */
+        pax_meta_ensure(pdesc, pdesc->page, tupno);
 
         /* Une version marquée inutilisée par VACUUM n'existe plus. */
         if (pax_meta_is_unused(&pdesc->tuple_meta[tupno]))
@@ -2521,7 +2587,12 @@ pax_scan_page_desc(PaxScanDesc scan, Page page, BlockNumber blkno,
         scan->cached_desc = desc;
     }
 
-    pax_refresh_tuple_meta(desc, page);
+    /*
+     * Aucune revalidation ici : le balayage remplit les métadonnées à la
+     * demande via pax_meta_ensure(), au fur et à mesure qu'il les examine.
+     * Les chemins « one-shot » (UPDATE, DELETE, verrouillage, lecture d'un
+     * TID) utilisent pax_build_page_desc(), qui revalide tout.
+     */
 
     MemoryContextSwitchTo(oldc);
 
