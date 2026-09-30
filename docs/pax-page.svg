@@ -28,8 +28,8 @@
   </defs>
 
   <rect width="820" height="900" fill="#ffffff"/>
-  <text class="t" x="24" y="34">Page PAX v3 — disposition columnaire (pax_am)</text>
-  <text class="sub" x="24" y="55">BLCKSZ = 8192 o · aucun line pointer · métadonnées et valeurs regroupées par colonne</text>
+  <text class="t" x="24" y="34">Page PAX v4 — disposition columnaire (pax_am)</text>
+  <text class="sub" x="24" y="55">BLCKSZ = 8192 o · aucun line pointer · slots packés sans suralignement (pas = attlen)</text>
 
   <!-- ============ PAGE ============ -->
   <g>
@@ -75,7 +75,7 @@
     <!-- 5. colonne 0 -->
     <rect class="frame" x="90" y="354" width="360" height="96" fill="#cfe3d3"/>
     <text class="lblb" x="102" y="372">Région colonne 0 — id (int4)</text>
-    <text class="szr mono" x="438" y="372" text-anchor="end">8 + 4×8 = 40 o</text>
+    <text class="szr mono" x="438" y="372" text-anchor="end">8 + 4×4 = 24 o</text>
     <rect x="102" y="378" width="336" height="20" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
     <text class="sz mono" x="109" y="392">bitmap de NULL (1 o → align 8 o)</text>
     <rect x="102" y="402" width="81" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
@@ -86,12 +86,12 @@
     <text class="sz mono" x="277" y="415">3</text>
     <rect x="354" y="402" width="84" height="17" fill="#a8d0b2" stroke="#7fae8b" stroke-width="1"/>
     <text class="sz mono" x="361" y="415">4</text>
-    <text class="sz mono" x="102" y="436">slots 4 o alignés : stride = MAXALIGN(attlen)</text>
+    <text class="sz mono" x="102" y="436">slots de 4 o : pas = attlen, sans MAXALIGN</text>
 
     <!-- 6. colonne 1 -->
     <rect class="frame" x="90" y="450" width="360" height="96" fill="#d9d6ea"/>
     <text class="lblb" x="102" y="468">Région colonne 1 — payload (text)</text>
-    <text class="szr mono" x="438" y="468" text-anchor="end">8 + 4×8 = 40 o</text>
+    <text class="szr mono" x="438" y="468" text-anchor="end">8 + 4×2 = 16 o</text>
     <rect x="102" y="474" width="336" height="20" fill="#c6c2dd" stroke="#8d86b5" stroke-width="1"/>
     <text class="sz mono" x="109" y="488">bitmap de NULL (1 o → align 8 o)</text>
     <rect x="102" y="498" width="81" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
@@ -102,7 +102,7 @@
     <text class="sz mono" x="277" y="511">@8192</text>
     <rect x="354" y="498" width="84" height="17" fill="#b7b2d4" stroke="#8d86b5" stroke-width="1"/>
     <text class="sz mono" x="361" y="511">@8216</text>
-    <text class="sz mono" x="102" y="532">slots 2 o = offset ABSOLU de la valeur</text>
+    <text class="sz mono" x="102" y="532">slots de 2 o = offset ABSOLU de la valeur</text>
 
     <!-- 7. espace libre -->
     <rect class="frame" x="90" y="546" width="360" height="100" fill="#f4f6f8" stroke-dasharray="5 3"/>

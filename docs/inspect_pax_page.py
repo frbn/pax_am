@@ -18,7 +18,7 @@ Les structures decodees correspondent exactement a pax_am.c (format v3) :
     xmin 4, xmax 4, cmin 4, cmax 4, t_ctid 6, flags 2, locker_mxid 4, pad 4
 
   region par colonne : [bitmap de NULL][slots]
-    slot = MAXALIGN(attlen) si longueur fixe, 2 o si varlena
+    v4 : slot = attlen si longueur fixe, 2 o si varlena
 
   PaxSpecialData (8 o) en fin de page
     version 2, flags 2, n_attrs 2, magic 2
@@ -51,7 +51,8 @@ def bitmap_size(n):
 
 
 def slot_stride(attlen):
-    return maxalign(attlen) if attlen and attlen > 0 else maxalign(2)
+    """v4 : pas exact = attlen, ou 2 octets pour un varlena (OffsetNumber)."""
+    return attlen if attlen and attlen > 0 else 2
 
 
 def run_sql(psql, db, sql):
@@ -244,14 +245,19 @@ def verify_layout(page, p, cols):
     if p["meta_end"] - p["meta_offset"] != exp:
         problems.append(("meta", f"{p['meta_end'] - p['meta_offset']} != {n}x32={exp}"))
 
+    # v4 : le span peut depasser la taille utile car chaque region s'ouvre
+    # alignee sur 8 octets ; il doit simplement pouvoir la contenir.
     for i, r in enumerate(p["regions"]):
         if r is None or i >= len(cols):
             continue
         atlen = cols[i]["attlen"]
-        stride = maxalign(atlen) if atlen > 0 else maxalign(2)
+        stride = slot_stride(atlen)
         want = bitmap_size(n) + n * stride
-        if r["size"] != want:
-            problems.append((f"col{i}", f"{r['size']} != bitmap+n*{stride}={want}"))
+        if r["size"] < want:
+            problems.append((f"col{i}", f"span {r['size']} < besoin {want}"))
+        # v4 ne pose plus aucune contrainte d'alignement : les lectures
+        # passent par memcpy cote AM. Le span peut donc depasser la taille
+        # utile si une region a ete ouverte avant qu'une autre ne pousse.
 
     return problems
 

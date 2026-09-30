@@ -4,10 +4,10 @@ PAX (“Partition Attributes Across”) is a PostgreSQL table access-method
 prototype using a column-oriented physical page layout.
 
 The current prototype supports sequential and TID INSERT/UPDATE/DELETE/SELECT,
-basic MVCC version chains, row locking, COPY, and Generic WAL crash recovery for
-PostgreSQL 19devel. It does **not** implement indexes, VACUUM, freezing,
-speculative insertion, or a v2-to-v3 page migration, and must not be used for
-production data.
+basic MVCC version chains, row locking, COPY, byte-packed columnar storage, and
+Generic WAL crash recovery for PostgreSQL 19devel. It does **not** implement
+indexes, VACUUM, freezing, speculative insertion, or a page-version migration,
+and must not be used for production data.
 
 Build and test against a configured PostgreSQL 19 installation with:
 
@@ -53,18 +53,17 @@ Résultat actuel, 50 000 lignes, PostgreSQL 19devel :
 
 | Famille | PAX vs heap | Verdict |
 |---|---|---|
-| Taille brute | 1,34x à 1,95x | PAX perd |
-| Taille compressée | 0,82x à 1,04x | PAX gagne ou égalité |
-| Lecture projetée | 6,7x à 9,3x | PAX perd |
-| Lecture complète | 2,4x à 8,4x | PAX perd |
+| Taille brute | 1,12x à 1,41x | PAX perd |
+| Taille compressée | 0,75x à 0,93x | **PAX gagne partout** |
+| Lecture projetée | 6,4x à 8,8x | PAX perd |
+| Lecture complète | 2,4x à 8,7x | PAX perd |
 
 Concrètement : **le seul avantage aujourd'hui mesuré est la taille après
-compression**. PAX occupe jusqu'à deux fois plus d'espace brut, mais la
-disposition columnaire ramène la taille compressée au niveau de heap, voire en
-dessous. En revanche la projection partielle — l'argument central du stockage
-columnaire — n'est pas exploitée, et PAX s'y révèle plus lent que heap. Ce sont
-des mesures, pas des prévisions : voir `analyse1.md` sections 8 et 12 pour les
-causes côté code.
+compression**, où PAX est désormais 7 % à 25 % plus petit que heap. En
+contrepartie il occupe toujours 12 % à 41 % d'espace brut en plus, et la
+projection partielle — l'argument central du stockage columnaire — n'est pas
+exploitée : PAX y reste plus lent que heap. Ce sont des mesures, pas des
+prévisions ; voir `analyse1.md` sections 8 et 12 pour les causes côté code.
 
 ## Schémas de stockage
 
@@ -72,7 +71,7 @@ Trois diagrammes SVG illustrent la disposition physique des pages :
 
 - [`docs/heap-page.svg`](docs/heap-page.svg) — page heap classique : line
   pointers, tuples autoporteurs, espace libre central.
-- [`docs/pax-page.svg`](docs/pax-page.svg) — page PAX v3 : aucun line pointer,
+- [`docs/pax-page.svg`](docs/pax-page.svg) — page PAX v4 : aucun line pointer,
   métadonnées columnaires de 32 o par version, une région par colonne, valeurs
   varlena en haut de page.
 - [`docs/pax-page-reelle.svg`](docs/pax-page-reelle.svg) — **une page PAX

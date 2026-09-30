@@ -61,7 +61,15 @@
 /* extension */
 PG_MODULE_MAGIC;
 
-#define PAX_PAGE_VERSION            3
+/*
+ * 1 = format initial
+ * 2 = introduction des colonnes en régions
+ * 3 = métadonnées de version séparées (32 o) + maillons t_ctid
+ * 4 = slots packés sans suralignement (pas = attlen, ou 2 pour un varlena).
+ *     Une page v3 serait relue avec un pas faux : les versions 3 et 4 sont
+ *     incompatibles, pas seulement différentes.
+ */
+#define PAX_PAGE_VERSION            4
 #define PAX_SPECIAL_MAGIC           0x5041 /* "PA" */
 
 #define PAX_FLAG_HAS_NULLS          0x0001
@@ -157,7 +165,12 @@ typedef struct PaxPageHeader
 typedef struct PaxMinipage
 {
     char       *data;           /* pointeur vers les valeurs */
+    char       *scratch;        /* copie de travail pour les lectures par
+                                 * référence : les régions ne sont pas
+                                 * alignées pour leur type, on ne fait donc
+                                 * jamais d'accès direct déaligné */
     int16       attlen;         /* longueur fixe ou -1 */
+    Size        stride;         /* pas d'un slot = attlen, ou 2 pour varlena */
     char        attalign;
     bool        is_varlena;
     bool        has_nulls;
@@ -243,9 +256,11 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 
 /* Size / page layout */
 static Size         pax_slot_stride(Form_pg_attribute attr);
+static Size         pax_region_used(int n_tuples, Size stride);
 static Size         pax_bitmap_size(int n_tuples);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
-                                            bool *isnulls, int tupno);
+                                            bool *isnulls, int tupno,
+                                            PaxPageHeader *phdr);
 static OffsetNumber pax_alloc_payload(Page page, Datum value, int16 attlen);
 static Size         pax_region_size(Page page, PaxPageHeader *phdr,
                                     int n_attrs, int i);
@@ -860,8 +875,10 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         PaxMinipage      *mp   = &desc->minipages[i];
         OffsetNumber      off  = phdr->offsets[i];
+        MemoryContext     oldc;
         Size              stride;
         Size              rsize;
+        Size              used;
         Size              bmp;
 
         mp->attlen     = attr->attlen;
@@ -870,6 +887,8 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
         mp->has_nulls  = false;     /* true si un bitmap est présent */
         mp->null_bitmap = NULL;
         mp->n_values   = phdr->n_tuples;
+        mp->stride     = pax_slot_stride(attr);
+        mp->scratch    = NULL;
 
         if (!PaxOffsetIsValid(off))
         {
@@ -878,23 +897,34 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
             continue;
         }
 
-        stride = pax_slot_stride(attr);
-        rsize  = pax_region_size(page, phdr, desc->n_attrs, i);
+        /* Tampon de recopie pour les colonnes de longueur fixe passées par
+         * référence : elles sont rendues depuis le descripteur et non depuis
+         * la page, pour ne jamais exposer une adresse déalignée. */
+        if (attr->attlen > 0 && attr->attlen != 1 && attr->attlen != 2 &&
+            attr->attlen != 4 && attr->attlen != 8)
+        {
+            oldc = MemoryContextSwitchTo(desc->ctx);
+            mp->scratch = palloc(attr->attlen);
+            MemoryContextSwitchTo(oldc);
+        }
 
-        if (rsize < (Size) desc->n_tuples * stride)
-            elog(ERROR, "pax: inconsistent page layout for column %d "
-                        "(region %zu, %d tuples x %zu)",
-                 i, rsize, desc->n_tuples, stride);
+        stride = mp->stride;
+        rsize  = pax_region_size(page, phdr, desc->n_attrs, i);
+        used   = pax_region_used(desc->n_tuples, stride);
 
         /*
-         * Région = [bitmap de NULL][valeurs] sans espace perdu : tout le
-         * reste est la taille du bitmap (0 => absent).
+         * Le span jusqu'à la région suivante peut dépasser la taille utile :
+         * chaque région s'ouvre alignée sur 8 octets, donc la fin de la
+         * précédente laisse jusqu'à 7 octets de bourrage. Ce qui compte est
+         * que le span puisse contenir la région.
          */
-        bmp = rsize - (Size) desc->n_tuples * stride;
-        if (bmp != pax_bitmap_size(desc->n_tuples))
-            elog(ERROR, "pax: invalid NULL bitmap size for column %d "
-                        "(region %zu, tuples %d, bitmap %zu)",
-                 i, rsize, desc->n_tuples, bmp);
+        if (rsize < used)
+            elog(ERROR, "pax: inconsistent page layout for column %d "
+                        "(span %zu, besoin %zu = bitmap %zu + %d tuples x %zu)",
+                 i, rsize, used, pax_bitmap_size(desc->n_tuples),
+                 desc->n_tuples, stride);
+
+        bmp = pax_bitmap_size(desc->n_tuples);
 
         if (bmp > 0)
         {
@@ -955,32 +985,58 @@ pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool *isnull)
         return (Datum) 0;
     }
 
-    /* page de champs de longueur fixe : une valeur par tuple, pas à pas MAXALIGN(attlen) */
+    /* Longueur fixe : la valeur est lue par memcpy car le slot n'est pas
+     * nécessairement aligné pour son type (les régions sont compactées au
+     * byte près et repoussées par les insertions suivantes). */
     if (!mp->is_varlena)
     {
-        ptr = mp->data + ((Size) tupno * MAXALIGN(mp->attlen));
+        ptr = mp->data + ((Size) tupno * mp->stride);
 
         switch (mp->attlen)
         {
             case 1:
-                return CharGetDatum(*ptr);
+            {
+                char c;
+
+                memcpy(&c, ptr, 1);
+                return CharGetDatum(c);
+            }
             case 2:
-                return Int16GetDatum(*(int16 *) ptr);
+            {
+                int16 v;
+
+                memcpy(&v, ptr, sizeof(int16));
+                return Int16GetDatum(v);
+            }
             case 4:
-                return Int32GetDatum(*(int32 *) ptr);
+            {
+                int32 v;
+
+                memcpy(&v, ptr, sizeof(int32));
+                return Int32GetDatum(v);
+            }
             case 8:
-                return Int64GetDatum(*(int64 *) ptr);
+            {
+                int64 v;
+
+                memcpy(&v, ptr, sizeof(int64));
+                return Int64GetDatum(v);
+            }
             default:
-                /* by-reference fixed (uuid, macaddr, …) */
-                return PointerGetDatum(ptr);
+                /* by-reference fixed (uuid, macaddr, …) : on recopie dans le
+                 * descripteur plutôt que de pointer dans la page, pour ne pas
+                 * exposer à l'exécuteur une adresse non alignée. */
+                memcpy(mp->scratch, ptr, mp->attlen);
+                return PointerGetDatum(mp->scratch);
         }
     }
 
-    /* page de champs de longueur variable : table d'offsets, un entrée MAXALIGNée par tuple */
+    /* page de champs de longueur variable : table d'offsets, 2 octets par tuple */
     {
-        OffsetNumber off =
-            *(OffsetNumber *) (mp->data +
-                               ((Size) tupno * MAXALIGN(sizeof(OffsetNumber))));
+        OffsetNumber off;
+
+        memcpy(&off, mp->data + ((Size) tupno * mp->stride),
+               sizeof(OffsetNumber));
 
         if (!PaxOffsetIsValid(off))
         {
@@ -999,20 +1055,34 @@ pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool *isnull)
 /* ------------------------------------------------------------------ */
 
 /*
- * Pas d'unification à la volée : chaque valeur fixe occupe
- * MAXALIGN(attlen) octets et chaque valeur variable une entrée d'offset
- * MAXALIGN(OffsetNumber) octets. Toutes les régions démarrent donc
- * alignées, et la lecture (pax_get_value) et l'écriture sont d'accord
- * sur le pas.
+ * Pas d'un slot : la longueur exacte, sans suralignement.
+ *
+ * Un int4 occupe donc 4 octets et non 8, une OffsetNumber 2 et non 8.
+ *
+ * Aucune contrainte d'alignement n'est conservée : les régions sont
+ * compactées au byte près et repoussées par les insertions suivantes, donc
+ * un slot peut se retrouver à une adresse non alignée pour son type. La
+ * lecture passe systématiquement par memcpy (voir pax_get_value), ce qui
+ * reste correct et portable sur toute architecture.
+ *
+ * Les colonnes varlena stockent une OffsetNumber (offset absolu de la valeur
+ * allouée en haut de page), soit 2 octets.
  */
 static Size
 pax_slot_stride(Form_pg_attribute attr)
 {
     if (attr->attlen > 0)
-        return MAXALIGN(attr->attlen);
+        return (Size) attr->attlen;
 
     /* attlen -1 (varlena) ou -2 (cstring) : table d'offsets */
-    return MAXALIGN(sizeof(OffsetNumber));
+    return sizeof(OffsetNumber);
+}
+
+/* Taille utile d'une région : bitmap de NULL puis les slots. */
+static Size
+pax_region_used(int n_tuples, Size stride)
+{
+    return pax_bitmap_size(n_tuples) + (Size) n_tuples * stride;
 }
 
 static Size
@@ -1026,10 +1096,15 @@ pax_bitmap_size(int n_tuples)
 
 /*
  * Espace (borne supérieure) exigé pour insérer ce tuple dans une page qui
- * contient déjà "tupno" tuples. 
+ * contient déjà "tupno" tuples.
+ *
+ * "phdr" permet de ne provisionner le bourrage d'alignement que pour les
+ * colonnes réellement absentes de la page ; passer NULL revient à supposer
+ * qu'aucune région n'existe encore (page neuve).
  */
 static Size
-pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls, int tupno)
+pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls,
+                        int tupno, PaxPageHeader *phdr)
 {
     TupleDesc   tupdesc = RelationGetDescr(rel);
     Size        bitmap_delta = pax_bitmap_size(tupno + 1) -
@@ -1151,13 +1226,17 @@ pax_meta_region_size(Page page, PaxPageHeader *phdr)
 
 
 /*
- * Insère "len" octets (doit être MAXALIGNé) à la position absolue "at" en
- * décalant tout ce qui suit vers la droite.  Les régions qui commencent à
- * "at" ou après sont décalées, sauf celle qu'on remplit (region_idx).
+ * Insère "len" octets à la position absolue "at" en décalant tout ce qui
+ * suit vers la droite.  Les régions qui commencent à "at" ou après sont
+ * décalées, sauf celle qu'on remplit (region_idx).
  *
  * C'est ce décalage qui permet à une colonne de grandir sans quitter sa
  * région : les zones de haut niveau (bitmap de pd_upper) ne sont pas
  * touchées car on ne déplace que [at, pd_lower[.
+ *
+ * "len" n'est plus forcément multiple de 8 : insérer un slot vaut strlen,
+ * soit 2 ou 4 octets. C'est sans conséquence, les lectures se faisant par
+ * memcpy.
  */
 static void
 pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
@@ -1166,7 +1245,6 @@ pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
     PageHeader  hdr = (PageHeader) page;
     int         j;
 
-    Assert(len == MAXALIGN(len));
     Assert(at <= (Size) hdr->pd_lower);
 
     if (hdr->pd_lower > hdr->pd_upper ||
@@ -1272,6 +1350,8 @@ pax_find_visible_tuple(PaxScanDesc scan, PaxPageDesc *pdesc, int start)
 
     return -1;
 }
+
+/* see tupletable.h */
 
 static void
 pax_store_tuple_slot(Relation rel, TupleTableSlot *slot, Buffer buffer,
@@ -2045,7 +2125,8 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
         /* n_tuples lu APRÈS le lock : l'état peut avoir changé */
         h      = PaxPageHeaderPtr(p);
-        needed = pax_insert_space_needed(rel, values, isnulls, h->n_tuples);
+        needed = pax_insert_space_needed(rel, values, isnulls, h->n_tuples,
+                                         PaxPageHeaderPtr(p));
 
         if (pax_page_free_space(p) >= needed)
         {
@@ -2089,7 +2170,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     if (page_is_new)
     {
         pax_page_init(page, natts);
-        needed = pax_insert_space_needed(rel, values, isnulls, 0);
+        needed = pax_insert_space_needed(rel, values, isnulls, 0, NULL);
         available = pax_page_free_space(page);
         if (available < needed)
         {
@@ -2162,35 +2243,37 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         Form_pg_attribute attr   = TupleDescAttr(tupdesc, i);
         Size              stride = pax_slot_stride(attr);
         Size              region_start;
-        Size              rsize;
         Size              cur;        /* taille actuelle du bitmap */
         Size              want;       /* taille voulue du bitmap */
         Size              at;
         bits8            *bmp;
 
-        /* Première écriture de cette colonne : la région s'ouvre à la fin
-         * de la zone des régions (pd_lower). */
+        /*
+         * Première écriture de cette colonne : la région s'ouvre à la fin de
+         * la zone des régions (pd_lower), au byte près. Aucune contrainte
+         * d'alignement n'est posée ici : les lectures passent par memcpy
+         * (voir pax_get_value), donc un slot déaligné reste correct.
+         */
         if (!PaxOffsetIsValid(phdr->offsets[i]))
             phdr->offsets[i] = (OffsetNumber) pghdr->pd_lower;
 
         region_start = phdr->offsets[i];
-        rsize = pax_region_size(page, phdr, natts, i);
-        Assert(rsize >= (Size) tupno * stride);
-        cur = rsize - (Size) tupno * stride;     /* = bitmap seul */
 
-        /* 3a) le bitmap doit couvrir le bit "tupno" (0 = NULL, 1 = valeur) */
+        /* 3a) le bitmap doit couvrir le bit "tupno" (0 = NULL, 1 = valeur).
+         * Sa taille se déduit du nombre de versions, et non du span de la
+         * région : le bourrage d'alignement rend le span non canonique. */
+        cur  = pax_bitmap_size(tupno);
         want = pax_bitmap_size(tupno + 1);
         if (want > cur)
         {
             at = region_start + cur;
             pax_insert_bytes(page, phdr, natts, i, at, want - cur);
             memset((char *) page + at, 0, want - cur);
-            cur = want;
         }
         bmp = (bits8 *) ((char *) page + region_start);
 
         /* 3b) réserver l'emplacement de la valeur dans la région */
-        at = region_start + cur + (Size) tupno * stride;
+        at = region_start + want + (Size) tupno * stride;
         pax_insert_bytes(page, phdr, natts, i, at, stride);
 
         /* 3c) positionner le bit, puis écrire la valeur */
