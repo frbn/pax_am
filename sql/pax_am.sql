@@ -367,6 +367,83 @@ FROM tpax_reuse;
 DROP TABLE tpax_reuse_size;
 DROP TABLE tpax_reuse;
 
+-- Indexes. Every version carries its own index entry, so an index scan must
+-- resolve a TID to that exact version and must NOT follow t_ctid: an entry left
+-- behind by an UPDATE would otherwise resolve to the replacement version and
+-- make the row appear twice, while remaining invisible to a seq scan.
+CREATE TABLE tpax_index (id int, payload text) USING pax;
+INSERT INTO tpax_index
+SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+CREATE INDEX tpax_index_id_idx ON tpax_index (id);
+
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id, payload FROM tpax_index WHERE id = 500;
+SELECT id, payload FROM tpax_index WHERE id = 500;
+RESET enable_seqscan;
+
+-- An UPDATE writes a new version elsewhere and inserts a new index entry for
+-- it. The entry for the old TID stays until the index is vacuumed, and must
+-- yield the old version (invisible), not the new one.
+UPDATE tpax_index SET payload = payload || '-u' WHERE id = 20;
+SET enable_seqscan = off;
+SELECT count(*) AS updated_row_via_index FROM tpax_index WHERE id = 20;
+RESET enable_seqscan;
+SELECT count(*) AS updated_row_via_seqscan FROM tpax_index WHERE id = 20;
+
+-- Updating an indexed column moves the row to a new key entirely.
+UPDATE tpax_index SET id = id + 100000 WHERE id = 21;
+SET enable_seqscan = off;
+SELECT count(*) AS old_key FROM tpax_index WHERE id = 21;
+SELECT count(*) AS new_key FROM tpax_index WHERE id = 100021;
+RESET enable_seqscan;
+
+-- DELETE: the entry must resolve to nothing.
+DELETE FROM tpax_index WHERE id = 22;
+SET enable_seqscan = off;
+SELECT count(*) AS deleted_row_via_index FROM tpax_index WHERE id = 22;
+RESET enable_seqscan;
+
+-- The index scan and the seq scan must agree on every row: any stale entry
+-- resolving to a live version would show up as a difference here.
+CREATE TEMP TABLE tpax_index_seq AS SELECT id, payload FROM tpax_index;
+SET enable_seqscan = off;
+CREATE TEMP TABLE tpax_index_idx AS SELECT id, payload FROM tpax_index;
+RESET enable_seqscan;
+SELECT (SELECT count(*) FROM tpax_index_seq) AS rows_via_seqscan,
+       (SELECT count(*) FROM tpax_index_idx) AS rows_via_indexscan,
+       (SELECT count(*) FROM (
+          (SELECT id, payload FROM tpax_index_idx
+             EXCEPT ALL SELECT id, payload FROM tpax_index_seq)
+          UNION ALL
+          (SELECT id, payload FROM tpax_index_seq
+             EXCEPT ALL SELECT id, payload FROM tpax_index_idx)) d) AS differences;
+
+-- A unique index must be enforced, on INSERT and on UPDATE. The visibility
+-- snapshot used for that check is SnapshotDirty, which also reports the xid of
+-- a concurrent inserter; it must be filled in on every call, since nbtree reads
+-- those output fields.
+CREATE TABLE tpax_unique (id int PRIMARY KEY, payload text) USING pax;
+INSERT INTO tpax_unique SELECT g, 'v' || g FROM generate_series(1, 500) g;
+INSERT INTO tpax_unique VALUES (1, 'duplicate');
+INSERT INTO tpax_unique VALUES (9999, 'free');
+UPDATE tpax_unique SET id = 2 WHERE id = 3;
+UPDATE tpax_unique SET id = 8888 WHERE id = 4;
+SELECT id FROM tpax_unique WHERE id IN (2, 3, 4, 8888) ORDER BY id;
+
+-- Index cleanup: VACUUM marks the dead versions, and the index scan then asks
+-- whether each of its entries may go. Without that second half the dead
+-- entries would stay forever. Page counts are not asserted: PostgreSQL returns
+-- freed index space only lazily, so their exact value is not a contract.
+DELETE FROM tpax_index WHERE id % 3 = 0;
+VACUUM tpax_index;
+SET enable_seqscan = off;
+SELECT count(*) AS rows_after_index_vacuum FROM tpax_index;
+RESET enable_seqscan;
+SELECT count(*) AS rows_after_index_vacuum_seqscan FROM tpax_index;
+
+DROP TABLE tpax_index;
+DROP TABLE tpax_unique;
+
 -- Fully empty trailing pages are truncated away.
 CREATE TABLE tpax_truncate (id int, payload text) USING pax;
 INSERT INTO tpax_truncate

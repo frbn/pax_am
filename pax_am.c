@@ -27,6 +27,7 @@
 #include "postgres.h"
 
 #include "access/tableam.h"
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/generic_xlog.h"
@@ -38,7 +39,11 @@
 #include "access/xact.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
+#include "catalog/index.h"
+#include "commands/progress.h"
+#include "pgstat.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "common/relpath.h"
@@ -58,7 +63,11 @@
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
+#include "postmaster/autovacuum.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplesort.h"
+#include "access/tidstore.h"
 
 
 /* extension */
@@ -247,6 +256,7 @@ typedef struct PaxTupleTableSlot
      * Les valeurs se rangent dans tts_values / tts_isnull 
      */
 } PaxTupleTableSlot;
+
 
 /* ------------------------------------------------------------------ */
 /* Scan descriptor                                                     */
@@ -515,6 +525,8 @@ static bool         pax_index_fetch_tuple(struct IndexFetchTableData *scan,
                                           ItemPointer tid, Snapshot snapshot,
                                           TupleTableSlot *slot,
                                           bool *call_again, bool *all_dead);
+static TransactionId pax_relation_index_delete_tuples(Relation rel,
+                                                      TM_IndexDeleteOp *delstate);
 static TransactionId pax_index_delete_tuples(Relation rel,
                                              TM_IndexDeleteOp *delstate);
 static void         pax_tuple_insert_speculative(Relation rel,
@@ -620,39 +632,316 @@ pax_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
     pax_report_unsupported("parallel table scans");
 }
 
+/*
+ * Index scans.
+ *
+ * Un index ne stocke que le TID d'une version, et cette version a sa PROPRE
+ * entrée : contrairement à heap, il n'y a pas de chaîne HOT, donc pas de racine
+ * de chaîne à remonter. Un UPDATE réinsère une entrée pointant sur la nouvelle
+ * version, et l'entrée de l'ancienne version reste en place jusqu'au VACUUM de
+ * l'index.
+ *
+ * Conséquence directe et importante : il ne faut PAS remonter la chaîne t_ctid
+ * ici. L'entrée qui désigne l'ancienne version doit rendre l'ancienne version,
+ * invisible pour le snapshot, afin que le filtre du lecteur la rejette. Si on
+ * suivait la chaîne, l'entrée périmée renverrait la version suivante, qui est
+ * visible, et la ligne apparaîtrait deux fois à l'écran alors que la table n'en
+ * contient qu'une. C'est exactement ce que fait une chaîne HOT de heap, et
+ * c'est pourquoi heap n'a pas ce problème : là, la seule entrée désigne la
+ * racine de la chaîne et non une version.
+ *
+ * Le descripteur de page est reconstruit à chaque TID : on saute d'une page à
+ * l'autre, et un tampon memoïsé ne serait pas réutilisable.
+ */
+typedef struct PaxIndexFetchData
+{
+    IndexFetchTableData xs_base;   /* DOIT être le premier champ */
+    Buffer          xs_cbuf;       /* page courante, épinglée */
+    BlockNumber     xs_cblkno;
+} PaxIndexFetchData;
+
 static struct IndexFetchTableData *
 pax_index_fetch_begin(Relation rel, uint32 flags)
 {
-    pax_report_unsupported("index scans");
-    return NULL;
+    PaxIndexFetchData *xscan = palloc0_object(PaxIndexFetchData);
+
+    xscan->xs_base.rel = rel;
+    xscan->xs_base.flags = flags;
+    xscan->xs_cbuf = InvalidBuffer;
+    xscan->xs_cblkno = InvalidBlockNumber;
+
+    return &xscan->xs_base;
 }
 
 static void
 pax_index_fetch_reset(struct IndexFetchTableData *data)
 {
-    pax_report_unsupported("index scans");
+    PaxIndexFetchData *xscan = (PaxIndexFetchData *) data;
+
+    if (BufferIsValid(xscan->xs_cbuf))
+    {
+        ReleaseBuffer(xscan->xs_cbuf);
+        xscan->xs_cbuf = InvalidBuffer;
+    }
+    xscan->xs_cblkno = InvalidBlockNumber;
 }
 
 static void
 pax_index_fetch_end(struct IndexFetchTableData *data)
 {
-    pax_report_unsupported("index scans");
+    PaxIndexFetchData *xscan = (PaxIndexFetchData *) data;
+
+    pax_index_fetch_reset(data);
+    pfree(xscan);
 }
 
 static bool
-pax_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
+pax_index_fetch_tuple(struct IndexFetchTableData *data, ItemPointer tid,
                       Snapshot snapshot, TupleTableSlot *slot,
                       bool *call_again, bool *all_dead)
 {
-    pax_report_unsupported("index scans");
-    return false;
+    PaxIndexFetchData  *xscan = (PaxIndexFetchData *) data;
+    Relation           rel = xscan->xs_base.rel;
+    BlockNumber        blkno;
+    OffsetNumber       offset;
+    int                tupno;
+    Buffer             buf;
+    PaxPageDesc       *pdesc;
+    PaxTupleMetaData   meta;
+    bool               visible;
+
+    /*
+     * Une seule version par entrée d'index : il n'y a donc jamais de second
+     * maillon à rendre pour le même TID.
+     */
+    *call_again = false;
+
+    if (all_dead != NULL)
+        *all_dead = false;
+
+    if (!ItemPointerIsValid(tid))
+        return false;
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offset = ItemPointerGetOffsetNumber(tid);
+    if (blkno >= RelationGetNumberOfBlocks(rel) ||
+        !OffsetNumberIsValid(offset))
+        return false;
+
+    CHECK_FOR_INTERRUPTS();
+
+    if (!BufferIsValid(xscan->xs_cbuf) || blkno != xscan->xs_cblkno)
+    {
+        xscan->xs_cbuf = ReleaseAndReadBuffer(xscan->xs_cbuf, rel, blkno);
+        xscan->xs_cblkno = blkno;
+    }
+    buf = xscan->xs_cbuf;
+
+    LockBuffer(buf, BUFFER_LOCK_SHARE);
+    if (!pax_page_is_valid(BufferGetPage(buf)))
+    {
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+             blkno, RelationGetRelationName(rel));
+    }
+
+    pdesc = pax_build_page_desc(BufferGetPage(buf), RelationGetDescr(rel));
+    tupno = (int) offset - 1;
+    if (tupno >= pdesc->n_tuples)
+    {
+        /*
+         * La page a été tronquée après la construction de l'index. L'entrée
+         * ne désigne plus rien : on la déclare morte pour que l'AM d'index la
+         * supprime au prochain passage, plutôt que d'échouer.
+         */
+        pax_free_page_desc(pdesc);
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        if (all_dead != NULL)
+            *all_dead = true;
+        return false;
+    }
+
+    meta = pdesc->tuple_meta[tupno];
+    visible = !pax_meta_is_unused(&meta) &&
+        pax_meta_satisfies_snapshot(&meta, snapshot);
+
+    if (visible)
+    {
+        /*
+         * Matérialisation sous le verrou de contenu : les valeurs sont
+         * copiées, donc le pin pourra être relâché par l'appelant.
+         */
+        pax_store_tuple_slot(rel, slot, buf, pdesc, tupno, false);
+        ExecMaterializeSlot(slot);
+    }
+    pax_free_page_desc(pdesc);
+    LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+    return visible;
+}
+
+/*
+ * Fait avancer l'horizon de conflit à partir des métadonnées d'une version.
+ *
+ * Même règle que HeapTupleHeaderAdvanceConflictHorizon() : une version dont
+ * l'insertion a été annulée, ou que sa propre transaction a supprimée, ne peut
+ * rien avoir touché, donc son xmax est ignoré. Seule une version insérée par
+ * une transaction validée, et remplacée par une AUTRE transaction, borne les
+ * lecteurs capables de voir ce que l'on supprime.
+ */
+static void
+pax_meta_advance_conflict_horizon(const PaxTupleMetaData *meta,
+                                  TransactionId *horizon)
+{
+    if (meta->xmin != FrozenTransactionId &&
+        !TransactionIdDidCommit(meta->xmin))
+        return;
+
+    if (TransactionIdIsValid(meta->xmax) &&
+        !TransactionIdEquals(meta->xmax, meta->xmin) &&
+        TransactionIdPrecedes(*horizon, meta->xmax))
+        *horizon = meta->xmax;
+}
+
+/*
+ * Nettoyage d'index : détermine quelles entrées d'index pointant sur des
+ * versions de PAX peuvent être supprimées.
+ *
+ * L'AM d'index fournit une liste de TID de table trouvés dans une de ses pages.
+ * Pour chacun, il faut répondre « cette version est-elle supprimable ? ». Si
+ * oui, l'entrée d'index correspondante peut disparaître.
+ *
+ * Contrairement à heap, une entrée d'index PAX ne pointe pas sur une chaîne
+ * HOT regroupée sur une page : PAX ne fait pas de mise à jour HOT, et une
+ * chaîne traverse les pages, t_ctid étant un offset physique. Chaque version
+ * a donc sa propre entrée d'index, et le TID fourni est déjà celui de la
+ * version à tester. Il n'y a pas de chaîne à parcourir : la seule nuance est
+ * qu'un verrou de ligne encore actif empêche de conclure.
+ *
+ * On renvoie le « snapshotConflictHorizon » : la valeur qui borne les
+ * transactions capables de voir les entrées supprimées. Elle sert en Hot
+ * Standby à créer un conflit de récupération au bon moment.
+ */
+static TransactionId
+pax_relation_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
+{
+    TransactionId snapshotConflictHorizon = InvalidTransactionId;
+    Buffer        buf = InvalidBuffer;
+    BlockNumber   buf_blkno = InvalidBlockNumber;
+    int           i;
+    int           finalndeltids = 0;
+
+    /* PAX n'indexe pas en descendant : ce mode n'est pas géré ici. */
+    Assert(!delstate->bottomup);
+
+    /*
+     * Les TID sont triés par bloc : on ne relit la page qu'une fois par bloc.
+     */
+    for (i = 0; i < delstate->ndeltids; i++)
+    {
+        TM_IndexDelete     *deltid = &delstate->deltids[i];
+        TM_IndexStatus     *istatus = delstate->status + deltid->id;
+        ItemPointer         htid = &deltid->tid;
+        BlockNumber         blkno = ItemPointerGetBlockNumber(htid);
+        PaxPageDesc        *pdesc;
+        PaxTupleMetaData    meta;
+        int                 tupno;
+        bool                deletable;
+
+        CHECK_FOR_INTERRUPTS();
+
+        if (blkno >= RelationGetNumberOfBlocks(rel))
+        {
+            /*
+             * L'entrée désigne une page qui n'existe plus : la relation a pu
+             * être tronquée après la construction de l'index. Ce n'est pas
+             * récupérable ici et heap ne le traite pas non plus comme une
+             * corruption ; on s'arrête et le reste du tableau sera retraité au
+             * prochain passage de VACUUM sur l'index.
+             */
+            break;
+        }
+
+        if (!BufferIsValid(buf) || blkno != buf_blkno)
+        {
+            if (BufferIsValid(buf))
+                UnlockReleaseBuffer(buf);
+            buf = ReadBuffer(rel, blkno);
+            buf_blkno = blkno;
+        }
+
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        if (!pax_page_is_valid(BufferGetPage(buf)))
+        {
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            elog(ERROR, "pax: invalid page %u in relation \"%s\"",
+                 blkno, RelationGetRelationName(rel));
+        }
+
+        pdesc = pax_build_page_desc(BufferGetPage(buf),
+                                    RelationGetDescr(rel));
+        tupno = (int) ItemPointerGetOffsetNumber(htid) - 1;
+
+        if (tupno < 0 || tupno >= pdesc->n_tuples)
+        {
+            /*
+             * L'index désigne un emplacement inexistant sur cette page. Un
+             * index sain ne peut pas contenir cela : c'est de la corruption,
+             * et, contrairement à heap qui le tolère, on le signale.
+             */
+            pax_free_page_desc(pdesc);
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("index \"%s\" contains an entry pointing to an"
+                            " invalid tuple (%u,%u) in table \"%s\"",
+                            RelationGetRelationName(delstate->irel), blkno,
+                            ItemPointerGetOffsetNumber(htid),
+                            RelationGetRelationName(rel)),
+                     errhint("The index should be dropped and recreated.")));
+        }
+
+        meta = pdesc->tuple_meta[tupno];
+        pax_free_page_desc(pdesc);
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+        /*
+         * Supprimable si la version est morte pour de bon et qu'aucun verrou
+         * de ligne ne retient plus la version : un lecteur verrouillé pourrait
+         * encore suivre la chaîne à partir d'elle.
+         */
+        deletable = pax_meta_is_unused(&meta) ||
+            (pax_meta_classify(&meta) == PAX_VERSION_DEAD &&
+             !pax_meta_has_live_locker(&meta));
+
+        if (istatus->knowndeletable)
+            deletable = true;
+
+        if (!deletable)
+            break;              /* les entrées suivantes ne sont pas examinées */
+
+        pax_meta_advance_conflict_horizon(&meta, &snapshotConflictHorizon);
+
+        finalndeltids = i + 1;
+    }
+
+    if (BufferIsValid(buf))
+        UnlockReleaseBuffer(buf);
+
+    /*
+     * Les entrées non supprimables sont à la fin du tableau : le rétrécir
+     * informe l'appelant. Ce n'est pas qu'une optimisation, l'AM d'index est
+     * autorisé à s'appuyer sur ndeltids pour décider qu'il n'y a rien à faire.
+     */
+    delstate->ndeltids = finalndeltids;
+
+    return snapshotConflictHorizon;
 }
 
 static TransactionId
 pax_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
-    pax_report_unsupported("index tuple deletion");
-    return InvalidTransactionId;
+    return pax_relation_index_delete_tuples(rel, delstate);
 }
 
 static void
@@ -910,13 +1199,15 @@ pax_vacuum_compact_payload(Page page, PaxPageHeader *phdr, TupleDesc tupdesc)
 static bool
 pax_vacuum_page(Relation rel, Buffer buf, BlockNumber blkno,
                 const VacuumParams *params, double *tups_vacuumed,
-                double *tups_recently_dead, bool *page_all_unused)
+                double *tups_recently_dead, bool *page_all_unused,
+                TidStore *dead_items)
 {
     Page            page;
     PaxPageHeader  *phdr;
     GenericXLogState *wal_state;
     PaxTupleMetaData *meta;
     int              i;
+    OffsetNumber     dead_offsets[MaxOffsetNumber];
     int              n_dead = 0;
     int              n_recent = 0;
     bool             changed = false;
@@ -1009,6 +1300,12 @@ pax_vacuum_page(Relation rel, Buffer buf, BlockNumber blkno,
         }
         m->flags |= PAX_VERSION_UNUSED;
         changed = true;
+
+        /*
+         * On note le TID pour le nettoyage des index. L'offset de TID vaut
+         * tupno + 1, comme partout ailleurs dans le format.
+         */
+        dead_offsets[n_dead] = (OffsetNumber) (i + 1);
         n_dead++;
     }
 
@@ -1036,7 +1333,84 @@ pax_vacuum_page(Relation rel, Buffer buf, BlockNumber blkno,
     *tups_vacuumed += n_dead;
     *tups_recently_dead += n_recent;
 
+    /*
+     * Les TID des versions viennent de mourir sont versés au fichier, pour que
+     * les AM d'index puissent décider quelles entrées supprimer. Cela se fait
+     * APRÈS le déverrouillage : la liste n'est utile qu'à la passe d'index, qui
+     * la relira sous ses propres verrous.
+     */
+    if (n_dead > 0 && dead_items != NULL)
+    {
+        CHECK_FOR_INTERRUPTS();
+        TidStoreSetBlockOffsets(dead_items, blkno, dead_offsets, n_dead);
+    }
+
     return changed;
+}
+
+/*
+ * Réponse de l'AM d'index qui demande si une version de table est morte.
+ *
+ * Elle ne connaît que le TID : on le cherche donc dans le fichier des versions
+ * mortes récolté pendant la passe sur la table. C'est exactement le mécanisme
+ * de heap, dont le callback fait la même chose.
+ */
+static bool
+pax_vac_tid_reaped(ItemPointer itemptr, void *state)
+{
+    return TidStoreIsMember((TidStore *) state, itemptr);
+}
+
+/*
+ * Nettoyage des index de la relation.
+ *
+ * Chaque AM d'index parcourt ses propres entrées et interroge la table pour
+ * savoir lesquelles peuvent disparaître. On lui fournit l'index et le fichier
+ * des TID morts ; c'est ce que fait vac_bulkdel_one_index() pour heap, en deux
+ * temps : suppression, puis nettoyage final qui rend les pages libérées.
+ */
+static void
+pax_vacuum_indexes(Relation rel, TidStore *dead_items,
+                   BufferAccessStrategy bstrategy)
+{
+    List       *indexoidlist;
+    ListCell   *lc;
+
+    indexoidlist = RelationGetIndexList(rel);
+
+    foreach(lc, indexoidlist)
+    {
+        Relation            indrel;
+        IndexVacuumInfo      ivinfo;
+        IndexBulkDeleteResult *istat;
+
+        indrel = index_open(lfirst_oid(lc), NoLock);
+
+        ivinfo.index = indrel;
+        ivinfo.heaprel = rel;
+        ivinfo.analyze_only = false;
+        ivinfo.report_progress = false;
+        ivinfo.estimated_count = true;
+        ivinfo.message_level = DEBUG2;
+        ivinfo.num_heap_tuples = 0;
+        ivinfo.strategy = bstrategy;
+
+        /*
+         * L'AM d'index parcourt ses entrées et demande si la version visée est
+         * morte ; pax_vac_tid_reaped() répond par le fichier ci-dessus. Le
+         * chemin « suppression descendante » passe, lui, par
+         * pax_relation_index_delete_tuples(), qui consulte les pages.
+         */
+        istat = index_bulk_delete(&ivinfo, NULL, pax_vac_tid_reaped,
+                                  dead_items);
+
+        istat = index_vacuum_cleanup(&ivinfo, istat);
+        pfree(istat);
+
+        index_close(indrel, NoLock);
+    }
+
+    list_free(indexoidlist);
 }
 
 static void
@@ -1049,6 +1423,30 @@ pax_relation_vacuum(Relation rel, const VacuumParams *params,
     BlockNumber  nkept = 0;
     double       tups_vacuumed = 0;
     double       tups_recently_dead = 0;
+    TidStore    *dead_items;
+    /*
+     * Même règle que vacuumlazy : un autovacuum peut avoir sa propre mémoire de
+     * travail, bornée pour ne pas laisser un seul VACUUM consommer celle du
+     * cluster entier.
+     */
+    int          vac_work_mem = AmAutoVacuumWorkerProcess() &&
+        autovacuum_work_mem != -1 ?
+        autovacuum_work_mem : maintenance_work_mem;
+
+    /*
+     * File des TID de versions mortes.
+     *
+     * C'est ce qui permet de nettoyer les index. L'AM d'index vaWalking ses
+     * entrées et nous demandera, pour chacune, « cette version est-elle
+     * morte ? » ; on répondra par l'appartenance au fichier. Sans lui, aucune
+     * entrée d'index ne peut être supprimée, alors que la table elle-même est
+     * bien nettoyée.
+     *
+     * On ne peut pas réutiliser celui de heap : il est créé et alimenté
+     * entièrement dans vacuumlazy.c, et il n'existe aucun callback d'AM de
+     * table pour y verser les TID morts. D'où ce fichier local.
+     */
+    dead_items = TidStoreCreateLocal((Size) vac_work_mem * 1024, true);
 
     nblocks = RelationGetNumberOfBlocks(rel);
 
@@ -1062,7 +1460,7 @@ pax_relation_vacuum(Relation rel, const VacuumParams *params,
         buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, strat);
         (void) pax_vacuum_page(rel, buf, blkno, params,
                                &tups_vacuumed, &tups_recently_dead,
-                               &all_unused);
+                               &all_unused, dead_items);
 
         if (all_unused)
             nkept = blkno;       /* encore traçable jusqu'ici */
@@ -1150,8 +1548,6 @@ pax_relation_vacuum(Relation rel, const VacuumParams *params,
 
 out:
     /* Le FSM est renseigné à l'insertion ; on le remet à jour. */
-
-    /* Le FSM est renseigne à l'insertion ; on le remet a jour. */
     for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
     {
         Buffer buf;
@@ -1165,6 +1561,20 @@ out:
         RecordPageWithFreeSpace(rel, blkno, free_space);
     }
 
+    /*
+     * Nettoyage des index, après la table : c'est l'ordre qu'exige la
+     * suppression d'une entrée, puisque l'AM d'index doit pouvoir constater que
+     * la version qu'elle désigne est morte.
+     *
+     * On reproduit ici ce que fait vacuumlazy.c pour heap. Le fichier de TID
+     * morts est le nôtre, et non celui de heap : il n'existe aucun callback
+     * d'AM de table pour alimenter celui de vacuumlazy, qui reste donc
+     * inaccessible à qui n'est pas heap.
+     */
+    if (tups_vacuumed > 0 && (params->options & VACOPT_SKIP_LOCKED) == 0)
+        pax_vacuum_indexes(rel, dead_items, strat);
+
+    TidStoreDestroy(dead_items);
 }
 
 /*
@@ -1289,6 +1699,27 @@ pax_scan_analyze_next_tuple(TableScanDesc scan, double *liverows,
     return false;
 }
 
+/*
+ * Construction d'index (CREATE INDEX).
+ *
+ * Le parcours est celui d'un balayage séquentiel ordinaire : on materialize
+ * chaque version et on la passe à l'AM d'index. Deux différences avec heap
+ * méritent d'être notées.
+ *
+ * Pas de chaînes HOT. Heap n'indexe que la version vivante d'une chaîne et la
+ * rattache au TID de la racine, ce qui préserve la chaîne et permet à
+ * PostgreSQL de ne pas mettre à jour l'index. PAX n'a pas d'équivalent :
+ * chaque version a sa propre entrée d'index, ce qui est plus coûteux à
+ * l'insertion mais beaucoup plus simple, et correct dès lors que la chaîne est
+ * suivie à la lecture (pax_index_fetch_walk). La contrepartie est qu'un UPDATE
+ * qui modifie une colonne indexée doit réinsérer une entrée d'index.
+ *
+ * Le snapshot. Comme heap, une construction non concurrente utilise
+ * SnapshotAny et fait son propre contrôle de viabilité, parce qu'elle doit
+ * indexer les versions RECENTLY_DEAD pour ne pas casser les transactions
+ * déjà ouvertes. Une construction concurrente, elle, prend un snapshot MVCC et
+ * indexe ce qui est visible.
+ */
 static double
 pax_index_build_range_scan(Relation table_rel, Relation index_rel,
                            IndexInfo *index_info, bool allow_sync,
@@ -1297,16 +1728,399 @@ pax_index_build_range_scan(Relation table_rel, Relation index_rel,
                            IndexBuildCallback callback, void *callback_state,
                            TableScanDesc scan)
 {
-    pax_report_unsupported("index builds");
-    return 0;
+    bool        is_system_catalog = IsSystemRelation(table_rel);
+    bool        checking_uniqueness;
+    Snapshot    snapshot;
+    bool        need_unregister_snapshot = false;
+    TransactionId OldestXmin = InvalidTransactionId;
+    double      reltuples = 0;
+    ExprState  *predicate;
+    TupleTableSlot *slot;
+    EState     *estate;
+    ExprContext *econtext;
+    BlockNumber previous_blkno = InvalidBlockNumber;
+    ScanDirection direction = ForwardScanDirection;
+    double      processed = 0;
+    double      total = 0;
+
+    Datum       values[INDEX_MAX_KEYS];
+    bool        isnull[INDEX_MAX_KEYS];
+
+    Assert(OidIsValid(index_rel->rd_rel->relam));
+
+    checking_uniqueness = (index_info->ii_Unique ||
+                           index_info->ii_ExclusionOps != NULL);
+
+    Assert(!(anyvisible && checking_uniqueness));
+
+    estate = CreateExecutorState();
+    econtext = GetPerTupleExprContext(estate);
+    slot = table_slot_create(table_rel, NULL);
+    econtext->ecxt_scantuple = slot;
+
+    predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+    if (!IsBootstrapProcessingMode() && !index_info->ii_Concurrent)
+        OldestXmin = GetOldestNonRemovableTransactionId(table_rel);
+
+    if (!scan)
+    {
+        if (!TransactionIdIsValid(OldestXmin))
+        {
+            snapshot = RegisterSnapshot(GetTransactionSnapshot());
+            need_unregister_snapshot = true;
+        }
+        else
+            snapshot = SnapshotAny;
+
+        scan = table_beginscan_strat(table_rel, snapshot, 0, NULL,
+                                     true, allow_sync);
+    }
+    else
+        snapshot = scan->rs_snapshot;
+
+    Assert(snapshot == SnapshotAny || IsMVCCSnapshot(snapshot));
+    Assert(snapshot == SnapshotAny ? TransactionIdIsValid(OldestXmin) :
+           !TransactionIdIsValid(OldestXmin));
+    Assert(snapshot == SnapshotAny || !anyvisible);
+
+    if (progress)
+    {
+        total = (double) RelationGetNumberOfBlocks(table_rel);
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_TOTAL,
+                                     (uint64) total);
+    }
+
+    /*
+     * Limites de parcours. Le balayage de PAX n'implémente pas le syncscan, donc
+     * les bornes sont toujours posées explicitement.
+     */
+    if (!allow_sync || start_blockno != 0 ||
+        numblocks != InvalidBlockNumber)
+    {
+        ItemPointerData mintid;
+        ItemPointerData maxtid;
+
+        /*
+         * On traduit la plage de blocs en plage de TID : les versions d'une
+         * page sont contiguës en TID, donc une plage de blocs est exactement
+         * une plage de TID. C'est ce que table_rescan_tidrange attend, et
+         * PAX n'implémente pas le syncscan.
+         */
+        if (start_blockno > 0)
+            ItemPointerSet(&mintid, start_blockno - 1, 0);
+        else
+            ItemPointerSetInvalid(&mintid);
+
+        if (numblocks != InvalidBlockNumber)
+        {
+            BlockNumber last = start_blockno + numblocks;
+
+            if (last > RelationGetNumberOfBlocks(table_rel))
+                last = RelationGetNumberOfBlocks(table_rel);
+            ItemPointerSet(&maxtid, last, MaxOffsetNumber);
+        }
+        else
+            ItemPointerSetInvalid(&maxtid);
+
+        table_rescan_tidrange(scan, &mintid, &maxtid);
+    }
+
+    for (;;)
+    {
+        bool        tupleIsAlive;
+        TransactionId xwait;
+        PaxScanDesc pscan = (PaxScanDesc) scan;
+
+        CHECK_FOR_INTERRUPTS();
+
+    recheck:
+
+        if (!table_scan_getnextslot(scan, direction, slot))
+            break;
+
+        if (pscan->current_block != previous_blkno)
+        {
+            previous_blkno = pscan->current_block;
+            if (progress)
+            {
+                processed = (double) (previous_blkno + 1);
+                pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE,
+                                             (uint64) processed);
+            }
+        }
+
+        if (snapshot == SnapshotAny)
+        {
+            /*
+             * Contrôle de viabilité explicite, sur les métadonnées de version
+             * copiées dans le slot. Même critère que
+             * pax_scan_analyze_next_tuple(), sinon CREATE INDEX et ANALYZE
+             * produiraient des valeurs de reltuples très différentes.
+             */
+            PaxTupleMetaData meta = ((PaxTupleTableSlot *) slot)->tuple_meta;
+
+            /* Place libérée par VACUUM : elle n'a plus de lecture à faire. */
+            if (pax_meta_is_unused(&meta))
+                continue;
+
+            switch (pax_meta_classify(&meta))
+            {
+                case PAX_VERSION_DEAD:
+                    /* Définitivement morte : ni indexée ni comptée. */
+                    continue;
+
+                case PAX_VERSION_LIVE:
+                    tupleIsAlive = true;
+                    reltuples += 1;
+                    break;
+
+                case PAX_VERSION_RECENT:
+                    /*
+                     * On l'indexe quand même : une transaction déjà ouverte
+                     * doit pouvoir s'en servir une fois l'index construit. Elle
+                     * ne compte pas dans reltuples.
+                     */
+                    tupleIsAlive = false;
+                    break;
+            }
+
+            if (TransactionIdIsInProgress(meta.xmin) &&
+                !TransactionIdIsCurrentTransactionId(meta.xmin))
+            {
+                xwait = meta.xmin;
+
+                /*
+                 * Inattendu hors catalogue système : cela signifie qu'une
+                 * insertion concurrente a eu lieu alors qu'on tient un
+                 * ShareLock. Heap avertit aussi dans ce cas.
+                 */
+                if (!is_system_catalog)
+                    elog(WARNING,
+                         "concurrent insert in progress within table \"%s\"",
+                         RelationGetRelationName(table_rel));
+
+                /*
+                 * Indexer une insertion en cours ferait échouer une unique
+                 * à tort : on attend la fin de la transaction, puis on
+                 * réexamine.
+                 */
+                if (checking_uniqueness)
+                {
+                    XactLockTableWait(xwait, table_rel, &slot->tts_tid,
+                                      XLTW_InsertIndexUnique);
+                    CHECK_FOR_INTERRUPTS();
+                    goto recheck;
+                }
+
+                tupleIsAlive = true;
+                reltuples += 1;
+            }
+            else if (TransactionIdIsInProgress(meta.xmax) &&
+                     !TransactionIdIsCurrentTransactionId(meta.xmax) &&
+                     !TransactionIdIsCurrentTransactionId(meta.xmin))
+            {
+                xwait = meta.xmax;
+
+                if (!is_system_catalog)
+                    elog(WARNING,
+                         "concurrent delete in progress within table \"%s\"",
+                         RelationGetRelationName(table_rel));
+
+                /*
+                 * Supposer la ligne morte ferait manquer une violation
+                 * d'unicité, donc on attend avant de conclure.
+                 */
+                if (checking_uniqueness)
+                {
+                    XactLockTableWait(xwait, table_rel, &slot->tts_tid,
+                                      XLTW_InsertIndexUnique);
+                    CHECK_FOR_INTERRUPTS();
+                    goto recheck;
+                }
+
+                /*
+                 * Sans contrôle d'unicité, on l'indexe mais sans la compter,
+                 * comme pour une version récemment morte.
+                 */
+                tupleIsAlive = true;
+                reltuples += 1;
+            }
+        }
+        else
+        {
+            /* table_scan_getnextslot a fait le contrôle de temps. */
+            tupleIsAlive = true;
+            reltuples += 1;
+        }
+
+        MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+        /* Index partiel : on écarte ce qui ne satisfait pas le prédicat. */
+        if (predicate != NULL && !ExecQual(predicate, econtext))
+            continue;
+
+        /*
+         * Extrait les attributs utilisés par l'index, et évalue les
+         * expressions éventuelles.
+         */
+        FormIndexDatum(index_info, slot, estate, values, isnull);
+
+        /*
+         * PAX n'a pas de chaîne HOT : le TID à indexer est celui de la version
+         * materializee, tel quel.
+         */
+        callback(index_rel, &slot->tts_tid, values, isnull, tupleIsAlive,
+                 callback_state);
+    }
+
+    if (progress)
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE,
+                                     (uint64) total);
+
+    table_endscan(scan);
+
+    if (need_unregister_snapshot)
+        UnregisterSnapshot(snapshot);
+
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExecutorState(estate);
+
+    /* Ils pointaient sur l'estate qui vient d'être détruit. */
+    index_info->ii_ExpressionsState = NIL;
+    index_info->ii_PredicateState = NULL;
+
+    return reltuples;
 }
 
+/*
+ * Validation d'un index en cours de construction (CREATE INDEX CONCURRENTLY).
+ *
+ * Deuxième passage, destiné à attraper les écritures concurrentes que le
+ * premier passage a pu manquer. La table est rejouée dans le snapshot de
+ * l'appelant, et ses TID sont fusionnés avec ceux que l'index contient, triés
+ * dans un tuplesort.
+ *
+ * Contrairement à ce que suggère le nom, ce passage ne se contente pas de
+ * signaler : comme heap, il RÉINSÈRE les entrées manquantes. C'est ce qui rend
+ * CREATE INDEX CONCURRENTLY capable d'aboutir malgré les écritures concurrentes.
+ *
+ * PAX n'a pas de chaînes HOT, donc pas de TID racine à reconstruire : le TID de
+ * la version materializee est directement celui à comparer et à réinsérer.
+ */
 static void
 pax_index_validate_scan(Relation table_rel, Relation index_rel,
                         IndexInfo *index_info, Snapshot snapshot,
                         ValidateIndexState *state)
 {
-    pax_report_unsupported("index validation");
+    TableScanDesc scan;
+    TupleTableSlot *slot;
+    EState       *estate;
+    ExprContext   *econtext;
+    ExprState     *predicate;
+    ItemPointer    indexcursor = NULL;
+    ItemPointerData decoded;
+    bool          tuplesort_empty = false;
+    BlockNumber   previous_blkno = InvalidBlockNumber;
+    PaxScanDesc   pscan;
+
+    Datum         values[INDEX_MAX_KEYS];
+    bool          isnull[INDEX_MAX_KEYS];
+
+    Assert(OidIsValid(index_rel->rd_rel->relam));
+
+    estate = CreateExecutorState();
+    econtext = GetPerTupleExprContext(estate);
+    slot = table_slot_create(table_rel, NULL);
+    econtext->ecxt_scantuple = slot;
+
+    predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+    scan = table_beginscan(table_rel, snapshot, 0, NULL, 0);
+    pscan = (PaxScanDesc) scan;
+
+    pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_TOTAL,
+                                 RelationGetNumberOfBlocks(table_rel));
+
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+    {
+        ItemPointerData heapcursor = slot->tts_tid;
+
+        CHECK_FOR_INTERRUPTS();
+
+        state->htups += 1;
+
+        if ((previous_blkno == InvalidBlockNumber) ||
+            (pscan->current_block != previous_blkno))
+        {
+            pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE,
+                                         pscan->current_block);
+            previous_blkno = pscan->current_block;
+        }
+
+        /*
+         * Fusion : on avance dans le tuplesort tant qu'il n'a pas atteint ou
+         * dépassé le TID courant de la table.
+         */
+        while (!tuplesort_empty &&
+               (!indexcursor ||
+                ItemPointerCompare(indexcursor, &heapcursor) < 0))
+        {
+            Datum ts_val;
+            bool  ts_isnull;
+
+            tuplesort_empty = !tuplesort_getdatum(state->tuplesort, true,
+                                                   false, &ts_val, &ts_isnull,
+                                                   NULL);
+            Assert(tuplesort_empty || !ts_isnull);
+            if (!tuplesort_empty)
+            {
+                itemptr_decode(&decoded, DatumGetInt64(ts_val));
+                indexcursor = &decoded;
+            }
+            else
+                indexcursor = NULL;   /* reste propre */
+        }
+
+        /*
+         * Le tuplesort a dépassé (ou est épuisé) sans avoir rencontré ce TID :
+         * l'entrée manque dans l'index, on la réinsère.
+         */
+        if (tuplesort_empty ||
+            ItemPointerCompare(indexcursor, &heapcursor) > 0)
+        {
+            MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+            /* Index partiel : on écarte ce qui ne satisfait pas le prédicat. */
+            if (predicate != NULL && !ExecQual(predicate, econtext))
+                continue;
+
+            FormIndexDatum(index_info, slot, estate, values, isnull);
+
+            /*
+             * Une version morte mais récemment morte doit tout de même être
+             * indexée, sinon une transaction déjà ouverte ne la reverrait pas
+             * alors qu'elle l'a peut-être indexée elle-même. Le contrôle
+             * d'unicité reste en revanche nécessaire : c'est lui qui détecte un
+             * conflit réel.
+             */
+            index_insert(index_rel, values, isnull, &heapcursor, table_rel,
+                         index_info->ii_Unique ?
+                         UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
+                         false, index_info);
+
+            state->tups_inserted += 1;
+        }
+    }
+
+    table_endscan(scan);
+
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExecutorState(estate);
+
+    /* Ils pointaient sur l'estate qui vient d'être détruit. */
+    index_info->ii_ExpressionsState = NIL;
+    index_info->ii_PredicateState = NULL;
 }
 
 static bool
@@ -2220,6 +3034,94 @@ pax_meta_xmin_visible(const PaxTupleMetaData *meta, Snapshot snapshot)
     if (snapshot->snapshot_type == SNAPSHOT_ANY)
         return true;
 
+    /*
+     * SNAPSHOT_NON_VACUUMABLE : visible si la version pourrait être visible
+     * pour QUELQUE transaction. C'est l'inverse de « supprimable », que la
+     * fonction de visibilité globale tranche avec l'horizon de vacuum. C'est
+     * le snapshot utilisé pour décider ce que VACUUM peut marquer.
+     *
+     * SNAPSHOT_DIRTY : c'est le snapshot utilisé par le contrôle d'unicité
+     * d'un AM d'index pour détecter un doublon concurrent. Il voit les
+     * transactions validées, celles encore en cours, ET les commandes
+     * précédentes de la transaction courante.
+     */
+    if (snapshot->snapshot_type == SNAPSHOT_NON_VACUUMABLE)
+    {
+        /*
+         * Visible si elle pourrait l'être pour quelque transaction : c'est
+         * l'inverse de « supprimable », que le test global décide avec
+         * l'horizon de vacuum et l'inconnue des transactions en cours.
+         */
+        if (meta->xmin == FrozenTransactionId ||
+            meta->xmin == BootstrapTransactionId)
+            return true;
+        if (TransactionIdIsCurrentTransactionId(meta->xmin))
+            return true;
+        return !GlobalVisTestIsRemovableXid(snapshot->vistest,
+                                            meta->xmin, true);
+    }
+
+    if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+    {
+        TransactionId raw_xmin;
+        TransactionId raw_xmax;
+
+        /*
+         * Ce snapshot sert aussi d'ARGUMENT DE SORTIE : l'AM d'index y lit les
+         * xid des transactions concurrentes pour décider s'il doit attendre
+         * leur sort avant de conclure à un conflit d'unicité. Il faut donc les
+         * REMPLIR à chaque appel.
+         *
+         * InitDirtySnapshot() ne pose que snapshot_type : sans cette
+         * initialisation, nbtree lirait des données de pile non initialisées,
+         * d'où des xid fantômes et des plantages dans pg_subtrans. C'est
+         * exactement ce que produit l'oubli de ce remplissage.
+         */
+        snapshot->xmin = InvalidTransactionId;
+        snapshot->xmax = InvalidTransactionId;
+        snapshot->speculativeToken = 0;
+
+        raw_xmin = meta->xmin;
+        raw_xmax = meta->xmax;
+
+        /* --- Qui a inséré ? --- */
+        if (raw_xmin == FrozenTransactionId ||
+            raw_xmin == BootstrapTransactionId)
+            ;                       /* toujours visible */
+        else if (TransactionIdIsCurrentTransactionId(raw_xmin))
+            return true;           /* nos propres écritures sont visibles */
+        else if (TransactionIdIsInProgress(raw_xmin))
+        {
+            /*
+             * Insérée par une autre transaction en cours : la ligne existe pour
+             * elle, c'est donc un conflit potentiel. On rend le xid pour que
+             * l'appelant attende avant de se prononcer.
+             */
+            snapshot->xmin = raw_xmin;
+            return true;
+        }
+        else if (!TransactionIdDidCommit(raw_xmin))
+            return false;          /* insertion annulée : invisible */
+
+        /* L'insertion est validée : reste à savoir qui a remplacé la ligne. */
+        if (!TransactionIdIsValid(raw_xmax))
+            return true;
+
+        if (TransactionIdIsCurrentTransactionId(raw_xmax))
+            return false;          /* nous l'avons supprimée : pas de conflit */
+
+        if (TransactionIdIsInProgress(raw_xmax))
+        {
+            snapshot->xmax = raw_xmax;
+            return true;
+        }
+
+        if (TransactionIdDidCommit(raw_xmax))
+            return false;          /* supprimée pour de bon */
+
+        return true;               /* la suppression a été annulée */
+    }
+
     self_snapshot = snapshot->snapshot_type == SNAPSHOT_SELF;
     if (snapshot->snapshot_type != SNAPSHOT_MVCC && !self_snapshot)
         ereport(ERROR,
@@ -2572,7 +3474,7 @@ pax_slot_materialize(TupleTableSlot *base)
     /* la ligne ne dépend plus de la page : on peut rendre le pin */
     if (BufferIsValid(slot->buffer))
     {
-        ReleaseBuffer(slot->buffer);
+            ReleaseBuffer(slot->buffer);
         slot->buffer = InvalidBuffer;
     }
     slot->page   = NULL;
