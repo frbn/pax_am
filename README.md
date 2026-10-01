@@ -10,8 +10,9 @@ for PostgreSQL 19devel.
 
 It does **not** implement indexes, speculative insertion, or a page-version
 migration, and must not be used for production data. VACUUM marks dead versions
-and freezes them, but reclaims space only by truncating trailing pages: the slots
-it frees are not yet reused by INSERT.
+and freezes them, reclaims their variable-length payloads in place, and lets a
+later INSERT reuse the vacated slots; a dead version that no INSERT refills still
+holds its 32 metadata bytes.
 
 Build and test against a configured PostgreSQL 19 installation with:
 

@@ -699,14 +699,211 @@ pax_relation_copy_for_cluster(Relation oldtable, Relation newtable,
 }
 
 /*
+ * Une charge utile (valeur de longueur variable) à déplacer lors d'une
+ * compaction. old_off est l'offset courant dans la page, lu dans la table
+ * d'offsets de la colonne.
+ */
+typedef struct PaxPayloadRef
+{
+    OffsetNumber  old_off;
+    OffsetNumber  new_off;
+    Size          len;        /* longueur alignée */
+    int           col;
+    int           tupno;
+} PaxPayloadRef;
+
+static int
+pax_payload_ref_cmp(const void *a, const void *b)
+{
+    const PaxPayloadRef *x = (const PaxPayloadRef *) a;
+    const PaxPayloadRef *y = (const PaxPayloadRef *) b;
+
+    /* Décroissant : on traite le plus haut d'abord. */
+    if (x->old_off > y->old_off)
+        return -1;
+    if (x->old_off < y->old_off)
+        return 1;
+    return 0;
+}
+
+/*
+ * VACUUM, compactage des charges utiles des versions mortes.
+ *
+ * Les versions mortes sont marquées PAX_VERSION_UNUSED sur place : le format
+ * interdit de retirer une version, car t_ctid est un offset PHYSIQUE
+ * (page, indice de version) et les liens entrants pointent ici depuis d'autres
+ * pages. Mais les octets qu'occupaient leurs valeurs de longueur variable, eux,
+ * sont dans la zone pd_upper et peuvent être rendus sans toucher aux régions.
+ *
+ * C'est ce qui rend la place récupérée réellement réutilisable : sans cela,
+ * INSERT ne réutilise un emplacement que s'il reste de la place contiguë, et
+ * une page pleine n'en a presque jamais.
+ *
+ * Trois propriétés rendent l'opération sûre :
+ *
+ *  - n_tuples ne change pas, donc aucun index de version ne bouge et les liens
+ *    t_ctid, y compris ceux pointant sur cette page depuis une autre, restent
+ *    exacts. Seuls des octets de charge utile bougent.
+ *  - les tables d'offsets de colonnes vivent sous pd_lower, dans les régions.
+ *    Elles ne sont pas décalées : on y réécrit la nouvelle valeur en place.
+ *  - un balayage relit la table d'offsets à chaque matérialisation et le fait
+ *    sous le verrou de contenu, donc il ne peut pas observer un décalage à
+ *    moitié fait. Son descripteur de page reste valide aussi : ni les offsets
+ *    de régions ni meta_offset ne bougent.
+ *
+ * Les charges utiles sont déplacées en descendant depuis le haut de la zone,
+ * ce qui garantit qu'aucune donnée source non encore copiée n'est écrasée :
+ * chaque destination est à une adresse inférieure ou égale à sa source, et
+ * toutes les sources au-dessus ont déjà été traitées.
+ *
+ * Renvoie true si des octets ont été récupérés.
+ */
+static bool
+pax_vacuum_compact_payload(Page page, PaxPageHeader *phdr, TupleDesc tupdesc)
+{
+    PaxTupleMetaData  *meta;
+    PaxPayloadRef     *refs;
+    Size               n_refs = 0;
+    Size               i;
+    int                c;
+    int                t;
+    int                n_tuples = phdr->n_tuples;
+    Size               top = BLCKSZ - SizeOfPaxSpecialData;
+    Size               cursor;
+    Size               old_upper;
+    bool               changed = false;
+
+    if (n_tuples == 0)
+        return false;
+
+    meta = (PaxTupleMetaData *) ((char *) page + phdr->meta_offset);
+
+    refs = (PaxPayloadRef *) palloc(sizeof(PaxPayloadRef) *
+                                    (Size) n_tuples *
+                                    (Size) MaxTupleAttributeNumber);
+    memset(refs, 0, sizeof(PaxPayloadRef) * (Size) n_tuples *
+           (Size) MaxTupleAttributeNumber);
+
+    for (c = 0; c < tupdesc->natts; c++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, c);
+        Size              bmp_size;
+        Size              region_start;
+        bits8            *bmp;
+
+        if (attr->attlen >= 0)
+            continue;                   /* valeur en ligne dans la région */
+        if (!PaxOffsetIsValid(phdr->offsets[c]))
+            continue;                   /* colonne absente : tout est NULL */
+
+        region_start = phdr->offsets[c];
+        bmp_size = pax_bitmap_size(n_tuples);
+        bmp = (bits8 *) ((char *) page + region_start);
+
+        for (t = 0; t < n_tuples; t++)
+        {
+            OffsetNumber off;
+            Size         len;
+
+            /* Une version morte n'est plus lue par personne. */
+            if (pax_meta_is_unused(&meta[t]))
+                continue;
+            if (att_isnull(t, bmp))
+                continue;
+
+            memcpy(&off, (char *) page + region_start + bmp_size +
+                   (Size) t * sizeof(OffsetNumber), sizeof(OffsetNumber));
+            if (!PaxOffsetIsValid(off))
+                continue;
+
+            if (attr->attlen == -2)
+                len = strlen((char *) page + off) + 1;
+            else
+                len = VARSIZE_ANY((char *) page + off);
+
+            refs[n_refs].old_off = off;
+            refs[n_refs].len = MAXALIGN(len);
+            refs[n_refs].col = c;
+            refs[n_refs].tupno = t;
+            n_refs++;
+        }
+    }
+
+    if (n_refs == 0)
+    {
+        pfree(refs);
+        /* Toutes les versions sont mortes ou la page n'a aucune valeur
+         * variable : la zone de charge utile est entièrement libérable. */
+        changed = ((Size) ((PageHeader) page)->pd_upper != top);
+        ((PageHeader) page)->pd_upper = (LocationIndex) top;
+        return changed;
+    }
+
+    qsort(refs, n_refs, sizeof(PaxPayloadRef), pax_payload_ref_cmp);
+
+    cursor = top;
+    for (i = 0; i < n_refs; i++)
+    {
+        PaxPayloadRef *r = &refs[i];
+
+        cursor -= r->len;
+        r->new_off = (OffsetNumber) cursor;
+
+        if (r->new_off != r->old_off)
+        {
+            memmove((char *) page + cursor, (char *) page + r->old_off,
+                    r->len);
+            changed = true;
+        }
+    }
+
+    /* Réécrit les tables d'offsets avec les nouvelles positions. */
+    for (i = 0; i < n_refs; i++)
+    {
+        PaxPayloadRef *r = &refs[i];
+        Size           region_start = phdr->offsets[r->col];
+        Size           bmp_size = pax_bitmap_size(n_tuples);
+
+        if (r->new_off == r->old_off)
+            continue;
+
+        memcpy((char *) page + region_start + bmp_size +
+               (Size) r->tupno * sizeof(OffsetNumber),
+               &r->new_off, sizeof(OffsetNumber));
+    }
+
+    /*
+     * pd_upper remonte : les charges utiles occupent [cursor, top) au lieu de
+     * [old_upper, top), donc la zone [old_upper, cursor) redevient libre.
+     *
+     * On l'efface : elle contenait des valeurs mortes, et une page brute
+     * lisible par pageinspect ne doit pas les révéler.
+     */
+    if (changed)
+    {
+        old_upper = (Size) ((PageHeader) page)->pd_upper;
+        Assert(cursor >= old_upper);
+        memset((char *) page + old_upper, 0, cursor - old_upper);
+    }
+
+    ((PageHeader) page)->pd_upper = (LocationIndex) cursor;
+
+    pfree(refs);
+
+    return changed;
+}
+
+/*
  * VACUUM, passe de nettoyage sur une page.
  *
  * Contrainte propre au format : les liens t_ctid sont des offsets PHYSIQUES
  * (page, indice de version). Retirer une version décalerait tous les slots
  * suivants de toutes les colonnes, et casserait les liens entrants pointant
- * sur cette page depuis d'autres. On ne compacte donc pas : une version morte
- * est marquée PAX_VERSION_UNUSED sur place, son emplacement restant réutilisable
- * par INSERT.
+ * sur cette page depuis d'autres. On ne compacte donc pas les versions : une
+ * version morte est marquée PAX_VERSION_UNUSED sur place, son emplacement
+ * restant réutilisable par INSERT. Seules les charges utiles des versions
+ * mortes sont compactées (pax_vacuum_compact_payload), ce qui ne touche ni
+ * n_tuples ni les régions.
  *
  * Renvoie true si la page a été modifiée (pour rejouer le WAL plus bas).
  */
@@ -814,6 +1011,16 @@ pax_vacuum_page(Relation rel, Buffer buf, BlockNumber blkno,
         changed = true;
         n_dead++;
     }
+
+    /*
+     * Compactage des charges utiles, dans la même image WAL : la page est
+     * réécrite au completion, donc le compactage est rejoué en cas de crash.
+     *
+     * On compacte même si aucune version n'a été marquée, car une passe
+     * précédente a pu laisser des charges utiles mortes derrière elle.
+     */
+    if (pax_vacuum_compact_payload(page, phdr, RelationGetDescr(rel)))
+        changed = true;
 
     if (changed)
     {
@@ -1761,6 +1968,36 @@ pax_bitmap_size(int n_tuples)
         return 0;
 
     return MAXALIGN(((Size) n_tuples + 7) / 8);
+}
+
+/*
+ * Espace requis pour les seules valeurs de longueur variable.
+ *
+ * C'est la part de l'insertion qui consomme réellement du pd_upper, et la
+ * seule part à vérifier pour réutiliser un emplacement UNUSED : les slots et
+ * les bits de bitmap existent déjà.
+ */
+static Size
+pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
+{
+    TupleDesc   tupdesc = RelationGetDescr(rel);
+    Size        need = 0;
+    int         i;
+
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+        if (isnulls[i] || attr->attlen >= 0)
+            continue;
+
+        if (attr->attlen == -2)
+            need += MAXALIGN(strlen(DatumGetPointer(values[i])) + 1);
+        else
+            need += MAXALIGN(VARSIZE_ANY(DatumGetPointer(values[i])));
+    }
+
+    return need;
 }
 
 /*
@@ -2853,6 +3090,8 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     Size             needed;
     Size             available;
     Size             hint;
+    Size             payload_needed;
+    bool             reusing;
     Size             meta_at;
     Size             meta_size;
     BlockNumber      target;
@@ -3047,7 +3286,58 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
     pghdr = (PageHeader) page;
     phdr  = PaxPageHeaderPtr(page);
-    tupno = phdr->n_tuples;
+
+    /*
+     * Cherche un emplacement libéré par VACUUM pour le réutiliser.
+     *
+     * Un emplacement UNUSED conserve déjà son slot dans chaque région et son
+     * bit dans chaque bitmap : il suffit donc de réécrire les valeurs par
+     * dessus, sans étendre ni les régions ni les métadonnées. C'est ce qui
+     * rend la place récupérée par le vacuum utilisable en place.
+     *
+     * On ne réutilise que si la page possède déjà toutes les régions de
+     * colonnes : une colonne absente (jamais écrite sur cette page, donc NULL
+     * partout) n'a pas de slot à réutiliser et devrait en créer un, ce qui
+     * exigerait d'agrandir la page — autant ajouter une version à la fin.
+     *
+     * Les valeurs variables restent allouées en haut de page et consomment
+     * donc de la place : la réutilisation n'est possible que si la page a la
+     * place pour ces seules valeurs, ce que pax_payload_space_needed()
+     * calcule. On vérifie cela AVANT de commiter le choix.
+     */
+    reusing = false;
+    if (phdr->n_tuples > 0)
+    {
+        PaxTupleMetaData *meta_base;
+        int                c;
+
+        for (c = 0; c < natts; c++)
+        {
+            if (!PaxOffsetIsValid(phdr->offsets[c]))
+                break;
+        }
+        if (c == natts)
+        {
+            payload_needed = pax_payload_space_needed(rel, values, isnulls);
+            if (pax_page_free_space(page) >= payload_needed)
+            {
+                meta_base = ((PaxTupleMetaData *)
+                             ((char *) page + phdr->meta_offset));
+                for (c = 0; c < phdr->n_tuples; c++)
+                {
+                    if (pax_meta_is_unused(&meta_base[c]))
+                    {
+                        tupno = c;
+                        reusing = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!reusing)
+        tupno = phdr->n_tuples;
 
     if (tupno >= MaxOffsetNumber)
     {
@@ -3080,14 +3370,30 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     /* === 3. Transaction metadata: one fixed record per tuple === */
     if (!PaxOffsetIsValid(phdr->meta_offset))
         elog(ERROR, "pax: missing transaction metadata region");
+
+    /*
+     * La région de métadonnées fait toujours n_tuples x 32 octets. La
+     * vérifier contre tupno ne vaudrait que pour un ajout simple : en
+     * réutilisation tupno < n_tuples alors que la région, elle, ne change pas.
+     */
     meta_size = pax_meta_region_size(page, phdr);
-    if (meta_size != (Size) tupno * SizeOfPaxTupleMetaData)
-        elog(ERROR, "pax: inconsistent transaction metadata region");
+    if (meta_size != (Size) phdr->n_tuples * SizeOfPaxTupleMetaData)
+        elog(ERROR, "pax: inconsistent transaction metadata region "
+                    "(region %zu, %d tuples x %zu)",
+             meta_size, phdr->n_tuples, SizeOfPaxTupleMetaData);
 
     meta_at = (Size) phdr->meta_offset +
         (Size) tupno * SizeOfPaxTupleMetaData;
-    pax_insert_bytes(page, phdr, natts, PAX_NO_REGION, meta_at,
-                     SizeOfPaxTupleMetaData);
+
+    /*
+     * En réutilisation, l'emplacement 32 octets existe déjà : on le
+     * réécrit sur place. Sinon on insère les octets, ce qui décale les
+     * versions suivantes et les régions.
+     */
+    if (!reusing)
+        pax_insert_bytes(page, phdr, natts, PAX_NO_REGION, meta_at,
+                         SizeOfPaxTupleMetaData);
+
     meta = ((PaxTupleMetaData *) ((char *) page + phdr->meta_offset)) + tupno;
     memset(meta, 0, SizeOfPaxTupleMetaData);
     meta->xmin = xmin;
@@ -3122,7 +3428,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
          * Sa taille se déduit du nombre de versions, et non du span de la
          * région : le bourrage d'alignement rend le span non canonique. */
         cur  = pax_bitmap_size(tupno);
-        want = pax_bitmap_size(tupno + 1);
+        want = reusing ? cur : pax_bitmap_size(tupno + 1);
         if (want > cur)
         {
             at = region_start + cur;
@@ -3131,9 +3437,25 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         }
         bmp = (bits8 *) ((char *) page + region_start);
 
-        /* 3b) réserver l'emplacement de la valeur dans la région */
-        at = region_start + want + (Size) tupno * stride;
-        pax_insert_bytes(page, phdr, natts, i, at, stride);
+        /*
+         * 3b) réserver l'emplacement de la valeur dans la région. En
+         * réutilisation le slot existe déjà, on n'insère rien ; seule la
+         * valeur est réécrite par-dessus.
+         *
+         * La base de la table des valeurs est la taille RÉELLE du bitmap, pas
+         * celle que l'insertion est en train de construire. En ajout simple
+         * les deux coïncident (want vient d'être atteint). En réutilisation
+         * elles diffèrent : tupno < n_tuples, donc pax_bitmap_size(tupno)
+         * serait trop petit, et l'offset partirait dans le milieu de la
+         * table existante, décalant tous les emplacements suivants. C'est
+         * ici que se lit le bitmap à la lecture (pax_build_page_layout),
+         * donc il faut exactement la même valeur.
+         */
+        at = region_start +
+            pax_bitmap_size(reusing ? phdr->n_tuples : tupno + 1) +
+            (Size) tupno * stride;
+        if (!reusing)
+            pax_insert_bytes(page, phdr, natts, i, at, stride);
 
         /* 3c) positionner le bit, puis écrire la valeur */
         if (isnulls[i])
@@ -3183,14 +3505,16 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     }
 
     /* === 5. Finaliser === */
-    phdr->n_tuples++;
+    /* En réutilisation, l'emplacement existe déjà : n_tuples ne bouge pas. */
+    if (!reusing)
+        phdr->n_tuples++;
     phdr->free_space = (uint16) pax_page_free_space(page);
 
     /* TID : offset de TID = tupno + 1 (les offsets de TID débutent à 1) */
     ItemPointerSet(&(slot->tts_tid), BufferGetBlockNumber(buf),
                    (OffsetNumber) (tupno + 1));
     ItemPointerCopy(&slot->tts_tid, &meta->t_ctid);
-    meta->flags = 0;
+    meta->flags = 0;                /* réutilisation : plus UNUSED */
     slot->tts_tableOid = RelationGetRelid(rel);
     if (slot->tts_ops == &TTSOpsPax)
     {

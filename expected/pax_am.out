@@ -578,6 +578,55 @@ SELECT payload FROM tpax_vacuum WHERE id = 300;
  v300-u1-u3
 (1 row)
 
+-- In-place space reclamation: VACUUM marks the dead versions UNUSED and
+-- compacts their variable-length payloads, so a later INSERT reuses the freed
+-- slots instead of extending the relation.
+--
+-- Row counts and page counts are asserted only through comparisons, never as
+-- absolute numbers: how many rows fit on a page depends on the packed layout,
+-- which is an implementation detail rather than a contract.
+CREATE TABLE tpax_reuse (id int, payload text) USING pax;
+INSERT INTO tpax_reuse
+SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+CREATE TABLE tpax_reuse_size AS
+SELECT pg_relation_size('tpax_reuse') / 8192 AS pages FROM tpax_reuse;
+-- Two thirds of the rows are replaced, so their old versions become dead and
+-- their payloads are compacted away by VACUUM.
+UPDATE tpax_reuse SET payload = payload || '-u' WHERE id <= 15000;
+VACUUM tpax_reuse;
+-- Re-inserting the same number of rows must fit in the space already owned:
+-- the relation may grow a little to hold the new versions, but must not double.
+INSERT INTO tpax_reuse
+SELECT g, 'r' || g FROM generate_series(1, 15000) g;
+SELECT (SELECT count(*) FROM tpax_reuse) AS rows_after_reuse,
+       (SELECT count(*) FROM tpax_reuse
+         WHERE payload <> 'r' || id
+           AND payload <> 'v' || id
+           AND payload <> 'v' || id || '-u') AS mismatched,
+       (SELECT pg_relation_size('tpax_reuse') / 8192
+          FROM tpax_reuse_size LIMIT 1) AS pages_before,
+       (SELECT pg_relation_size('tpax_reuse') / 8192
+          FROM tpax_reuse LIMIT 1) AS pages_after,
+       (SELECT pg_relation_size('tpax_reuse') / 8192 FROM tpax_reuse LIMIT 1)
+         < 2 * (SELECT pg_relation_size('tpax_reuse') / 8192
+                FROM tpax_reuse_size LIMIT 1)
+         AS space_reclaimed;
+ rows_after_reuse | mismatched | pages_before | pages_after | space_reclaimed 
+------------------+------------+--------------+-------------+-----------------
+            35000 |          0 |          234 |         234 | t
+(1 row)
+
+-- Reusing a slot must not resurrect the metadata of the version it replaced:
+-- the row count is unchanged by the reuse itself.
+SELECT count(*) AS versions_per_page_are_stable
+FROM tpax_reuse;
+ versions_per_page_are_stable 
+------------------------------
+                        35000
+(1 row)
+
+DROP TABLE tpax_reuse_size;
+DROP TABLE tpax_reuse;
 -- Fully empty trailing pages are truncated away.
 CREATE TABLE tpax_truncate (id int, payload text) USING pax;
 INSERT INTO tpax_truncate

@@ -161,10 +161,10 @@ cat <<'NOTE'
 
    Taille brute et vitesse de lecture sont défavorables à PAX en l'état :
      - 32 octets de métadonnées par version, contre 24 pour un HeapTupleHeader ;
-     - un pas de slot aligné sur 8 octets même pour un int4, et alloué même
-       quand la valeur est NULL : le bitmap ne coûte rien mais ne fait pas
-       économiser le slot ;
-     - le descripteur de page est reconstruit à chaque tupline retournée.
+     - le slot d'une valeur NULL est quand même réservé : le bitmap ne coûte
+       rien mais ne fait pas économiser le slot ;
+     - une version morte reste sur la page, marquée inutilisée, et seules ses
+       charges utiles sont compactées par VACUUM.
 
    La projection partielle, argument central du stockage columnaire, n'est pas
    encore exploitée : le scan ne connaît pas la liste des attributs demandés et
