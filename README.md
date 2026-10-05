@@ -14,9 +14,12 @@ reclaims their variable-length payloads in place, and lets a later INSERT reuse 
 vacated slots; a dead version that no INSERT refills still holds its 32 metadata
 bytes.
 
-Indexes work for reads, writes, unique constraints and VACUUM cleanup, but **a
-multi-row UPDATE on an indexed table deadlocks** and must not be relied upon. See
-`analyse1.md`, section 14, for what is implemented and what is still broken.
+Indexes work for reads, writes, unique constraints, multi-row UPDATE/DELETE and
+VACUUM cleanup. PAX declines nbtree's bottom-up index deletion — that is an
+optimisation the index AM may ask for and the table AM may refuse — so index
+cleanup progresses more slowly than on heap. See `analyse1.md`, section 13, for
+what is implemented and section 14 for the multi-row UPDATE deadlock that was fixed
+and how to reproduce it under `--enable-cassert`.
 
 Build and test against a configured PostgreSQL 19 installation with:
 

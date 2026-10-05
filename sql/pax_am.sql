@@ -403,6 +403,30 @@ SET enable_seqscan = off;
 SELECT count(*) AS deleted_row_via_index FROM tpax_index WHERE id = 22;
 RESET enable_seqscan;
 
+-- A multi-row UPDATE on an indexed table. Every row needs its new version
+-- written, its old index entry replaced, and the old version marked dead,
+-- while the scan is still walking the pages. nbtree then runs its own
+-- deletion checks over the pages it touched, which calls back into the table
+-- AM. This is where an unbalanced buffer content lock used to wedge the
+-- backend: the scan's next LockBuffer() waited on a lock it still held.
+UPDATE tpax_index SET payload = payload || '-m' WHERE id <= 300;
+
+-- The multi-row UPDATE must be complete and consistent: the new payload is
+-- visible once, the old one not at all, and both access paths agree.
+SELECT count(*) AS multi_updated_via_seqscan
+FROM tpax_index WHERE payload LIKE '%-m';
+SET enable_seqscan = off;
+SELECT count(*) AS multi_updated_via_index FROM tpax_index WHERE payload LIKE '%-m';
+RESET enable_seqscan;
+SELECT count(*) AS stale_payload_left FROM tpax_index WHERE payload LIKE '%-u';
+
+-- A multi-row DELETE exercises the same path from the other side.
+DELETE FROM tpax_index WHERE id <= 100;
+SET enable_seqscan = off;
+SELECT count(*) AS multi_deleted_via_index FROM tpax_index WHERE id <= 100;
+RESET enable_seqscan;
+SELECT count(*) AS rows_left FROM tpax_index;
+
 -- The index scan and the seq scan must agree on every row: any stale entry
 -- resolving to a live version would show up as a difference here.
 CREATE TEMP TABLE tpax_index_seq AS SELECT id, payload FROM tpax_index;

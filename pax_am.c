@@ -831,8 +831,20 @@ pax_relation_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
     int           i;
     int           finalndeltids = 0;
 
-    /* PAX n'indexe pas en descendant : ce mode n'est pas géré ici. */
-    Assert(!delstate->bottomup);
+    /*
+     * Suppression d'index descendante (bottom-up) : nbtree nous demande de
+     * considérer speculativement toutes les entrées d'une page d'index pour
+     * eviter un remplissage. C'est une optimisation, pas une obligation :
+     * refuser est toujours permis, l'AM d'index se contente alors de ne pas
+     * progresser sur ce passage. PAX préfère refuser plutôt que d'inventer
+     * une evaluation de cout comparable a celle de heap, qui repose sur la
+     * visibilite MVCC et les tailles de page -- deux notions que PAX n'a pas.
+     */
+    if (delstate->bottomup)
+    {
+        delstate->ndeltids = 0;
+        return InvalidTransactionId;
+    }
 
     /*
      * Les TID sont triés par bloc : on ne relit la page qu'une fois par bloc.
@@ -1384,7 +1396,12 @@ pax_vacuum_indexes(Relation rel, TidStore *dead_items,
         IndexVacuumInfo      ivinfo;
         IndexBulkDeleteResult *istat;
 
-        indrel = index_open(lfirst_oid(lc), NoLock);
+        /*
+         * index_open() n'acquiert aucun verrou avec NoLock, alors que le
+         * tampon partage est modifie par nbtree pendant index_bulk_delete().
+         * On tient donc un AccessShareLock explicite, liberé au meme endroit.
+         */
+        indrel = index_open(lfirst_oid(lc), AccessShareLock);
 
         ivinfo.index = indrel;
         ivinfo.heaprel = rel;
@@ -1407,7 +1424,7 @@ pax_vacuum_indexes(Relation rel, TidStore *dead_items,
         istat = index_vacuum_cleanup(&ivinfo, istat);
         pfree(istat);
 
-        index_close(indrel, NoLock);
+        index_close(indrel, AccessShareLock);
     }
 
     list_free(indexoidlist);
