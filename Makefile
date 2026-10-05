@@ -19,8 +19,9 @@ include $(PGXS)
 
 SHARED_BUFFERS_TEST = tests/compare_shared_buffers.sh
 COLUMNAR_BENCHMARK  = tests/benchmark_columnar.sh
+WIDE_PROJECTION_BENCHMARK = tests/compare_wide_projection.sh
 
-.PHONY: shared-buffers-test columnar-benchmark
+.PHONY: shared-buffers-test columnar-benchmark wide-projection-benchmark
 shared-buffers-test:
 	$(SHARED_BUFFERS_TEST)
 
@@ -28,4 +29,9 @@ shared-buffers-test:
 # Hors installcheck : resultats dependants de la machine, aucun golden.
 columnar-benchmark:
 	$(COLUMNAR_BENCHMARK)
+
+# Table large (12 colonnes, indexee) et requetes ne projetant que 1, 2 ou 11
+# colonnes. Hors installcheck : aucun golden.
+wide-projection-benchmark:
+	$(WIDE_PROJECTION_BENCHMARK)
 
