@@ -29,6 +29,19 @@ make install
 make installcheck
 ```
 
+An assertion-enabled build is worth using as the default test target: PG asserts
+`lockmode == BUFFER_LOCK_UNLOCK` on entry to `BufferLockAcquire`, so a buffer
+content-lock self-deadlock becomes an immediate `TRAP` with a backtrace instead of
+a silent hang. Buffer content locks are invisible to `pg_locks`,
+`pg_blocking_pids()` and `lock_timeout`, so there is no other way to see them.
+
+```sh
+make PG_CONFIG=/path/to/cassert/bin/pg_config
+cp pax_am.so /path/to/cassert/lib/postgresql/pax_am.so
+make installcheck PG_CONFIG=/path/to/cassert/bin/pg_config \
+                 PGHOST=/socket/dir PGPORT=NNNN PGUSER=you
+```
+
 To compare shared-buffer usage for one identical query on a `heap` table and
 a `pax` table:
 
