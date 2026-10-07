@@ -80,8 +80,17 @@ PG_MODULE_MAGIC;
  * 4 = slots packés sans suralignement (pas = attlen, ou 2 pour un varlena).
  *     Une page v3 serait relue avec un pas faux : les versions 3 et 4 sont
  *     incompatibles, pas seulement différentes.
+ *
+ * 5 = régions enchaînées et IMMOBILES (cf. PaxChunkHdr). La table des slots
+ *     d'une colonne ne vit plus dans la zone basse que l'insertion memmove
+ *     à chaque ligne : elle est repartie en blocs de taille fixe alloués une
+ *     fois dans l'arène, donc un bloc écrit ne bouge plus jamais. C'est ce qui
+ *     donne à une ligne PAX une adresse stable, comme une ligne de heap, et
+ *     rend possible une matérialisation paresseuse sans course de données.
+ *     Une page v4 serait relue en cherchant les slots là où ils ne sont plus :
+ *     v4 et v5 sont incompatibles.
  */
-#define PAX_PAGE_VERSION            4
+#define PAX_PAGE_VERSION            5
 #define PAX_SPECIAL_MAGIC           0x5041 /* "PA" */
 
 #define PAX_FLAG_HAS_NULLS          0x0001
@@ -159,15 +168,38 @@ typedef struct PaxPageHeader
     OffsetNumber meta_offset;   /* début de la région des métadonnées */
     uint16      free_space;     /* approximation car certains champs à taille variable */
     uint16      flags;
+    /*
+     * Version 5 : le plus bas offset atteint par un chunk.
+     *
+     * Chunks et charges utiles se partagent UNE seule descente, pd_upper, comme
+     * en version 4 : ils s'entrelacent mais ne se recouvrent jamais. Deux
+     * frontières séparées ont été essayées et sont une erreur : la zone des
+     * charges utiles doit pouvoir remonter jusqu'aux métadonnées, ce qui la
+     * ferait chevaucher la région des versions, et les métadonnées grossissent
+     * de 32 octets par ligne.
+     *
+     * Ce champ borne la seule opération qui déplacerait des octets, le
+     * compactage des charges utiles. Il est aujourd'hui inutilisé, le
+     * compactage étant désactivé (voir pax_vacuum_compact_payload), mais il
+     * fait partie du format : c'est lui qui permettrait de le réactiver un jour
+     * sans déplacer un seul chunk.
+     */
+    OffsetNumber chunk_floor;
 
     /*
-     * offsets[i] = offset absolu depuis le début de la page
-     * vers le début de la minipage de la colonne de l'indice.
+     * Version 5 : deux entrées par colonne, tête et queue de la chaîne de
+     * chunks. La tête sert à construire la mise en page (parcours complet),
+     * la queue permet d'ajouter un chunk en O(1) sans relire la chaîne.
+     *
+     * Remplace offsets[] de la version 4 : il n'y a plus de « région »
+     * contiguë par colonne, donc plus d'offset de région à corriger quand
+     * une insertion memmove la zone basse.
      */
-    OffsetNumber offsets[FLEXIBLE_ARRAY_MEMBER];
+    OffsetNumber chunk_head[FLEXIBLE_ARRAY_MEMBER];
 } PaxPageHeader;
 
-#define SizeOfPaxPageHeaderFixed    offsetof(PaxPageHeader, offsets)
+#define SizeOfPaxPageHeaderFixed    offsetof(PaxPageHeader, chunk_head)
+#define PAX_CHUNK_ENTRIES_PER_ATTR  2      /* tête et queue */
 
 /* là où commence l'en-tête PAX dans une page (càd après l'en-tête et les données spéciales). */
 #define PaxPageHeaderPtr(page)  \
@@ -181,7 +213,68 @@ typedef struct PaxPageHeader
  */
 #define PaxOffsetIsValid(off) \
     ((off) != InvalidOffsetNumber && (off) < BLCKSZ)
-#define PAX_NO_REGION          (-1)
+
+/* ------------------------------------------------------------------ */
+/* Chunks : la table des slots d'une colonne, découpée en blocs fixes   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Un chunk est le bloc qui contient, pour UNE colonne, le bitmap de NULL et
+ * la table des slots d'au plus PAX_CHUNK_MAX_ROWS versions.
+ *
+ * Il est alloué UNE FOIS, d'une taille fixe, dans l'arène du haut de page.
+ * C'est ce qui rend l'adresse d'une ligne stable :
+ *
+ *  - la zone basse, [meta_offset, pd_lower), ne contient plus que les
+ *    métadonnées de version, qu'aucune insertion ne déplace. Aucun
+ *    pointeur n'y est stocké, donc rien à corriger après un décalage ;
+ *  - l'arène, elle, commence à pd_upper et croît vers le bas. Generic
+ *    XLogFinish() recopie [pd_upper, BLCKSZ) tel quel et ne fait que REMPLIR
+ *    DE ZÉRO le trou [pd_lower, pd_upper). Un chunk y survit donc tel quel,
+ *    sans correctif, et sans qu'une écriture concurrente puisse le déplacer.
+ *
+ * Un chunk est-il alloué une seule fois pour toute la vie de la version ?
+ * Oui : sa taille ne dépend que du pas de la colonne, jamais du nombre de
+ * versions déjà présentes. C'est l'inverse du format v4, où la région
+ * grandissait au fil des insertions.
+ */
+typedef struct PaxChunkHdr
+{
+    OffsetNumber next_chunk;     /* chunk suivant de la même colonne, 0 = fin */
+    uint16       n_rows;         /* versions utilisées dans ce chunk */
+} PaxChunkHdr;
+
+#define SizeOfPaxChunkHdr   MAXALIGN(sizeof(PaxChunkHdr))
+/*
+ * 64, et c'est mesuré : sur une table de 2 000 lignes, le rapport pax/heap
+ * du nombre de pages, selon le nombre de colonnes, donne
+ *
+ *     rows/chunk    1 col   8 cols  12 cols
+ *          8      0.625     1.313    1.750
+ *         16      0.625     1.125    1.563
+ *         32      0.625     1.188    1.438
+ *         64      0.625     1.125    1.000
+ *
+ * 64 est le seul qui reste sous 1.0 jusqu'à 11 colonnes, et 1.0 pile à 12.
+ * Un chunk plus petit coûte trop d'en-têtes et de bitmaps : c'est le même
+ * effet que l'analyse de §16, où un découpage trop fin se paie très cher.
+ *
+ * Le compromis reste réel : au-delà de 12 colonnes, PAX reste un peu devant
+ * heap, à cause des 32 octets de métadonnées par version, inchangés en v5.
+ */
+#define PAX_CHUNK_MAX_ROWS  64
+
+StaticAssertDecl(SizeOfPaxChunkHdr == 8,
+                 "pax: chunk header must occupy exactly 8 bytes");
+StaticAssertDecl(PAX_CHUNK_MAX_ROWS >= 1 &&
+                 PAX_CHUNK_MAX_ROWS <= MaxOffsetNumber,
+                 "pax: chunk size must fit in an offset-dividing range");
+
+/*
+ * PAX_CHUNK_MAX_ROWS fait partie du format : il détermine le découpage
+ * tupno / PAX_CHUNK_MAX_ROWS. Le changer invalide les pages existantes, donc
+ * il doit être accompagné d'un changement de PAX_PAGE_VERSION.
+ */
 
 /* ------------------------------------------------------------------ */
 /* Descripteurs en mémoire                                             */
@@ -189,18 +282,26 @@ typedef struct PaxPageHeader
 
 typedef struct PaxMinipage
 {
-    char       *data;           /* pointeur vers les valeurs */
     char       *scratch;        /* copie de travail pour les lectures par
-                                 * référence : les régions ne sont pas
-                                 * alignées pour leur type, on ne fait donc
+                                 * référence : les chunks ne sont pas
+                                 * alignés pour leur type, on ne fait donc
                                  * jamais d'accès direct déaligné */
     int16       attlen;         /* longueur fixe ou -1 */
     Size        stride;         /* pas d'un slot = attlen, ou 2 pour varlena */
     char        attalign;
     bool        is_varlena;
-    bool        has_nulls;
-    bits8      *null_bitmap;    /* peut être NULL */
     uint16      n_values;
+
+    /*
+     * Version 5 : la colonne est une chaîne de chunks, résolue UNE FOIS par
+     * pax_build_page_layout et mise en cache avec le reste de la mise en
+     * page. pax_get_value() reste donc O(1) : elle indexe chunks[] par
+     * tupno / PAX_CHUNK_MAX_ROWS, sans suivre de pointeur.
+     */
+    OffsetNumber *chunks;       /* n_chunks entrées, offsets absolus */
+    int          n_chunks;
+    Size         chunk_size;    /* taille d'un chunk de cette colonne */
+    bool         has_nulls;     /* le bitmap vit dans chaque chunk */
 } PaxMinipage;
 
 typedef struct PaxPageDesc
@@ -225,7 +326,7 @@ typedef struct PaxPageDesc
     BlockNumber     stamp_blkno;
     uint16          stamp_flags;
     OffsetNumber    stamp_meta_offset;
-    OffsetNumber   *stamp_offsets;    /* n_attrs entrées */
+    OffsetNumber   *stamp_chunks;     /* n_attrs * PAX_CHUNK_ENTRIES_PER_ATTR */
     int             meta_capacity;    /* versions que tuple_meta peut contenir */
     /*
      * Curseur de revalidation : les entrées [0, meta_checked_through) ont été
@@ -278,7 +379,7 @@ typedef struct PaxScanDescData
     /*
      * Pin on the page being scanned, held across getnextslot calls exactly
      * like heap's rs_cbuf.  PaxPageDesc stores raw pointers into the page
-     * (mp->data, desc->header), so the page must stay pinned for as long as a
+     * (mp->chunks, desc->header), so the page must stay pinned for as long as a
      * descriptor derived from it can be in use.
      *
      * The content lock is deliberately NOT held here: it is taken and dropped
@@ -308,8 +409,13 @@ typedef PaxScanDescData *PaxScanDesc;
 /* Page mngmt */
 static void         pax_page_init(Page page, int n_attrs);
 static bool         pax_page_is_valid(Page page);
+static Size         pax_chunk_size(Size stride);
+static OffsetNumber pax_alloc_chunk(Page page, PaxPageHeader *phdr, Size size);
+static int          pax_chunk_index_of(int tupno);
+static int          pax_row_in_chunk(int tupno);
 static PaxPageDesc *pax_build_page_layout(Page page, BlockNumber blkno,
                                            TupleDesc tupdesc);
+static int          pax_load_column_chunks(PaxPageDesc *desc, int col);
 static bool         pax_layout_is_current(const PaxPageDesc *desc, Page page,
                                            BlockNumber blkno,
                                            PaxPageHeader *phdr,
@@ -324,21 +430,17 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 
 /* Size / page layout */
 static Size         pax_slot_stride(Form_pg_attribute attr);
-static Size         pax_region_used(int n_tuples, Size stride);
 static Size         pax_bitmap_size(int n_tuples);
 static Size         pax_insert_space_hint(Relation rel, Datum *values,
                                           bool *isnulls);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
                                             bool *isnulls, int tupno,
-                                            PaxPageHeader *phdr);
-static OffsetNumber pax_alloc_payload(Page page, Datum value, int16 attlen);
-static Size         pax_region_size(Page page, PaxPageHeader *phdr,
-                                    int n_attrs, int i);
+                                            Page page, PaxPageHeader *phdr);
+static int          pax_column_nchunks(Page page, PaxPageHeader *phdr, int col);
+static OffsetNumber pax_alloc_payload(Page page, PaxPageHeader *paxhdr,
+                                      Datum value, int16 attlen);
 static Size         pax_page_free_space(Page page);
 static Size         pax_meta_region_size(Page page, PaxPageHeader *phdr);
-static void         pax_insert_bytes(Page page, PaxPageHeader *phdr,
-                                     int n_attrs, int region_idx,
-                                     Size at, Size len);
 static bool         pax_meta_xmin_visible(const PaxTupleMetaData *meta,
                                           Snapshot snapshot);
 static bool         pax_meta_satisfies_snapshot(const PaxTupleMetaData *meta,
@@ -1004,194 +1106,45 @@ pax_relation_copy_for_cluster(Relation oldtable, Relation newtable,
  * compaction. old_off est l'offset courant dans la page, lu dans la table
  * d'offsets de la colonne.
  */
-typedef struct PaxPayloadRef
-{
-    OffsetNumber  old_off;
-    OffsetNumber  new_off;
-    Size          len;        /* longueur alignée */
-    int           col;
-    int           tupno;
-} PaxPayloadRef;
-
-static int
-pax_payload_ref_cmp(const void *a, const void *b)
-{
-    const PaxPayloadRef *x = (const PaxPayloadRef *) a;
-    const PaxPayloadRef *y = (const PaxPayloadRef *) b;
-
-    /* Décroissant : on traite le plus haut d'abord. */
-    if (x->old_off > y->old_off)
-        return -1;
-    if (x->old_off < y->old_off)
-        return 1;
-    return 0;
-}
-
 /*
  * VACUUM, compactage des charges utiles des versions mortes.
  *
- * Les versions mortes sont marquées PAX_VERSION_UNUSED sur place : le format
- * interdit de retirer une version, car t_ctid est un offset PHYSIQUE
- * (page, indice de version) et les liens entrants pointent ici depuis d'autres
- * pages. Mais les octets qu'occupaient leurs valeurs de longueur variable, eux,
- * sont dans la zone pd_upper et peuvent être rendus sans toucher aux régions.
+ * DÉSACTIVÉ en version 5, et c'est délibéré.
  *
- * C'est ce qui rend la place récupérée réellement réutilisable : sans cela,
- * INSERT ne réutilise un emplacement que s'il reste de la place contiguë, et
- * une page pleine n'en a presque jamais.
+ * La raison est structurelle, pas une imprécision à corriger. Chunks et charges
+ * utiles partagent la descente de pd_upper et s'entrelacent donc dans
+ * l'arène. Réunir les charges utiles vivantes vers le bas les ferait passer par
+ *-dessus les chunks croisés, qui seraient alors déplacés ou écrasés. Or un
+ * chunk déplacé invalide les adresses des lignes qu'il contient, donc la
+ * stabilité d'adresse que le format v5 achète.
  *
- * Trois propriétés rendent l'opération sûre :
+ * Deux différences entre version 4 et version 5, donc :
  *
- *  - n_tuples ne change pas, donc aucun index de version ne bouge et les liens
- *    t_ctid, y compris ceux pointant sur cette page depuis une autre, restent
- *    exacts. Seuls des octets de charge utile bougent.
- *  - les tables d'offsets de colonnes vivent sous pd_lower, dans les régions.
- *    Elles ne sont pas décalées : on y réécrit la nouvelle valeur en place.
- *  - un balayage relit la table d'offsets à chaque matérialisation et le fait
- *    sous le verrou de contenu, donc il ne peut pas observer un décalage à
- *    moitié fait. Son descripteur de page reste valide aussi : ni les offsets
- *    de régions ni meta_offset ne bougent.
+ *  - en v4, le compactage était sûr, parce que les régions vivaient sous
+ *    pd_lower et ne bougeaient jamais ;
+ *  - en v5, il faudrait réserver aux chunks une plage que le compactage
+ *    n'atteint pas. Les trois dispositions essayées pour y parvenir ont toutes
+ *    cassé autre chose : soit les charges utiles écrasaient les métadonnées,
+ *    soit les métadonnées écrasaient les chunks.
  *
- * Les charges utiles sont déplacées en descendant depuis le haut de la zone,
- * ce qui garantit qu'aucune donnée source non encore copiée n'est écrasée :
- * chaque destination est à une adresse inférieure ou égale à sa source, et
- * toutes les sources au-dessus ont déjà été traitées.
+ * Ce que la réutilisation d'emplacement conserve : INSERT réutilise un slot
+ * UNUSED sans rien agrandir, donc une page qui a été vacuumée accepte de
+ * nouvelles lignes à sa place. Seule la restitution des octets de charge
+ * utile, qui est un gain d'espace et non de validité, est perdue.
  *
- * Renvoie true si des octets ont été récupérés.
+ * phdr->chunk_floor existe précisément pour permettre de réactiver un jour le
+ * compactage en bornant sa descente : il suffirait d'interdire de descendre
+ * sous le plus bas chunk. Il est ici la preuve que l'obstacle est connu et
+ * délimité, pas une idée oubliée en route.
  */
 static bool
 pax_vacuum_compact_payload(Page page, PaxPageHeader *phdr, TupleDesc tupdesc)
 {
-    PaxTupleMetaData  *meta;
-    PaxPayloadRef     *refs;
-    Size               n_refs = 0;
-    Size               i;
-    int                c;
-    int                t;
-    int                n_tuples = phdr->n_tuples;
-    Size               top = BLCKSZ - SizeOfPaxSpecialData;
-    Size               cursor;
-    Size               old_upper;
-    bool               changed = false;
+    (void) page;
+    (void) phdr;
+    (void) tupdesc;
 
-    if (n_tuples == 0)
-        return false;
-
-    meta = (PaxTupleMetaData *) ((char *) page + phdr->meta_offset);
-
-    refs = (PaxPayloadRef *) palloc(sizeof(PaxPayloadRef) *
-                                    (Size) n_tuples *
-                                    (Size) MaxTupleAttributeNumber);
-    memset(refs, 0, sizeof(PaxPayloadRef) * (Size) n_tuples *
-           (Size) MaxTupleAttributeNumber);
-
-    for (c = 0; c < tupdesc->natts; c++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, c);
-        Size              bmp_size;
-        Size              region_start;
-        bits8            *bmp;
-
-        if (attr->attlen >= 0)
-            continue;                   /* valeur en ligne dans la région */
-        if (!PaxOffsetIsValid(phdr->offsets[c]))
-            continue;                   /* colonne absente : tout est NULL */
-
-        region_start = phdr->offsets[c];
-        bmp_size = pax_bitmap_size(n_tuples);
-        bmp = (bits8 *) ((char *) page + region_start);
-
-        for (t = 0; t < n_tuples; t++)
-        {
-            OffsetNumber off;
-            Size         len;
-
-            /* Une version morte n'est plus lue par personne. */
-            if (pax_meta_is_unused(&meta[t]))
-                continue;
-            if (att_isnull(t, bmp))
-                continue;
-
-            memcpy(&off, (char *) page + region_start + bmp_size +
-                   (Size) t * sizeof(OffsetNumber), sizeof(OffsetNumber));
-            if (!PaxOffsetIsValid(off))
-                continue;
-
-            if (attr->attlen == -2)
-                len = strlen((char *) page + off) + 1;
-            else
-                len = VARSIZE_ANY((char *) page + off);
-
-            refs[n_refs].old_off = off;
-            refs[n_refs].len = MAXALIGN(len);
-            refs[n_refs].col = c;
-            refs[n_refs].tupno = t;
-            n_refs++;
-        }
-    }
-
-    if (n_refs == 0)
-    {
-        pfree(refs);
-        /* Toutes les versions sont mortes ou la page n'a aucune valeur
-         * variable : la zone de charge utile est entièrement libérable. */
-        changed = ((Size) ((PageHeader) page)->pd_upper != top);
-        ((PageHeader) page)->pd_upper = (LocationIndex) top;
-        return changed;
-    }
-
-    qsort(refs, n_refs, sizeof(PaxPayloadRef), pax_payload_ref_cmp);
-
-    cursor = top;
-    for (i = 0; i < n_refs; i++)
-    {
-        PaxPayloadRef *r = &refs[i];
-
-        cursor -= r->len;
-        r->new_off = (OffsetNumber) cursor;
-
-        if (r->new_off != r->old_off)
-        {
-            memmove((char *) page + cursor, (char *) page + r->old_off,
-                    r->len);
-            changed = true;
-        }
-    }
-
-    /* Réécrit les tables d'offsets avec les nouvelles positions. */
-    for (i = 0; i < n_refs; i++)
-    {
-        PaxPayloadRef *r = &refs[i];
-        Size           region_start = phdr->offsets[r->col];
-        Size           bmp_size = pax_bitmap_size(n_tuples);
-
-        if (r->new_off == r->old_off)
-            continue;
-
-        memcpy((char *) page + region_start + bmp_size +
-               (Size) r->tupno * sizeof(OffsetNumber),
-               &r->new_off, sizeof(OffsetNumber));
-    }
-
-    /*
-     * pd_upper remonte : les charges utiles occupent [cursor, top) au lieu de
-     * [old_upper, top), donc la zone [old_upper, cursor) redevient libre.
-     *
-     * On l'efface : elle contenait des valeurs mortes, et une page brute
-     * lisible par pageinspect ne doit pas les révéler.
-     */
-    if (changed)
-    {
-        old_upper = (Size) ((PageHeader) page)->pd_upper;
-        Assert(cursor >= old_upper);
-        memset((char *) page + old_upper, 0, cursor - old_upper);
-    }
-
-    ((PageHeader) page)->pd_upper = (LocationIndex) cursor;
-
-    pfree(refs);
-
-    return changed;
+    return false;                     /* voir la note ci-dessus */
 }
 
 /*
@@ -2010,21 +1963,6 @@ pax_index_build_range_scan(Relation table_rel, Relation index_rel,
     return reltuples;
 }
 
-/*
- * Validation d'un index en cours de construction (CREATE INDEX CONCURRENTLY).
- *
- * Deuxième passage, destiné à attraper les écritures concurrentes que le
- * premier passage a pu manquer. La table est rejouée dans le snapshot de
- * l'appelant, et ses TID sont fusionnés avec ceux que l'index contient, triés
- * dans un tuplesort.
- *
- * Contrairement à ce que suggère le nom, ce passage ne se contente pas de
- * signaler : comme heap, il RÉINSÈRE les entrées manquantes. C'est ce qui rend
- * CREATE INDEX CONCURRENTLY capable d'aboutir malgré les écritures concurrentes.
- *
- * PAX n'a pas de chaînes HOT, donc pas de TID racine à reconstruire : le TID de
- * la version materializee est directement celui à comparer et à réinsérer.
- */
 static void
 pax_index_validate_scan(Relation table_rel, Relation index_rel,
                         IndexInfo *index_info, Snapshot snapshot,
@@ -2267,10 +2205,28 @@ pax_validate_table_am_routine(void)
         elog(ERROR, "pax: incomplete PG19 table AM routine");
 }
 
-/* ------------------------------------------------------------------ */
-/* Page management                                                     */
-/* ------------------------------------------------------------------ */
-
+/*
+ * Initialise une page neuve.
+ *
+ *   [meta_offset, pd_lower)  métadonnées de version, pd_lower MONTE
+ *   [pd_lower, pd_upper)     espace libre
+ *   [pd_upper, payload_top)  charges utiles,       pd_upper MONTE
+ *   [payload_top, top)       chunks,               payload_top DESCEND
+ *
+ * Les trois zones se remplissent par les trois bouts et se rejoignent au
+ * milieu. C'est l'ordre IMPÉRATIF du format.
+ *
+ * Les chunks et les charges utiles ne peuvent PAS partager la même descente :
+ * ils se chevaucheraient, et le compactage, qui déplace les charges utiles,
+ * écraserait des chunks. C'est l'erreur qui a été commise deux fois avant la
+ * bonne disposition, et qui se manifeste par une chaîne de chunks qui « se
+ * termine trop tôt » ou une page illisible.
+ *
+ * pd_upper est ici le sommet des charges utiles, et il MONTE donc. C'est
+ * cohérent avec GenericXLogFinish(), qui recopie [pd_upper, BLCKSZ) et ne
+ * remplit de zéros que le trou en dessous : tout ce qui est alloué est bien
+ * au-dessus.
+ */
 static void
 pax_page_init(Page page, int n_attrs)
 {
@@ -2289,7 +2245,8 @@ pax_page_init(Page page, int n_attrs)
     special->n_attrs  = (uint16) n_attrs;
     special->magic = PAX_SPECIAL_MAGIC;
 
-    header_size = SizeOfPaxPageHeaderFixed + n_attrs * sizeof(OffsetNumber);
+    header_size = SizeOfPaxPageHeaderFixed +
+        (Size) n_attrs * PAX_CHUNK_ENTRIES_PER_ATTR * sizeof(OffsetNumber);
     header_size = MAXALIGN(header_size);
 
     phdr = (PaxPageHeader *) ((char *) page + SizeOfPageHeaderData + SizeOfPaxSpecialData);
@@ -2298,12 +2255,16 @@ pax_page_init(Page page, int n_attrs)
     phdr->free_space = (uint16) (BLCKSZ - (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size));
     phdr->flags      = PAX_FLAG_HAS_XMIN_XMAX | PAX_FLAG_HAS_VERSIONS;
 
-    for (i = 0; i < n_attrs; i++)
-        phdr->offsets[i] = InvalidOffsetNumber;
+    for (i = 0; i < n_attrs * PAX_CHUNK_ENTRIES_PER_ATTR; i++)
+        phdr->chunk_head[i] = InvalidOffsetNumber;
+
+    /* Aucun chunk alloué : la borne est le sommet de l'arène. */
+    phdr->chunk_floor = (OffsetNumber) (BLCKSZ - SizeOfPaxSpecialData);
 
     ((PageHeader) page)->pd_lower =
         (LocationIndex) (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size);
     phdr->meta_offset = (OffsetNumber) ((PageHeader) page)->pd_lower;
+
 }
 
 static bool
@@ -2322,12 +2283,12 @@ pax_page_is_valid(Page page)
 }
 
 /*
- * Construit la partie « mise en page » d'un PaxPageDesc : géométrie des
- * régions, pas des slots, pointeurs vers les bitmap et les valeurs.
+ * Construit la partie « mise en page » d'un PaxPageDesc : chaînes de chunks,
+ * emplacement des slots, pointeurs vers les bitmap et les valeurs.
  *
  * Cette partie ne dépend QUE de l'en-tête de page. Elle reste donc valable
- * d'une tupline à l'autre tant que n_tuples, meta_offset, flags et offsets[]
- * ne changent pas : c'est ce que permet de la mettre en cache
+ * d'une tupline à l'autre tant que n_tuples, meta_offset, flags et
+ * chunk_head[] ne changent pas : c'est ce que permet de la mettre en cache
  * (pax_layout_is_current).
  *
  * Les métadonnées de version, elles, sont relues à chaque appel par
@@ -2341,7 +2302,6 @@ pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
     PaxSpecialData *special;
     PaxPageHeader  *phdr;
     int             i;
-    char           *base = (char *) page;
 
     special = (PaxSpecialData *) PageGetSpecialPointer(page);
 
@@ -2376,10 +2336,11 @@ pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
     desc->stamp_blkno      = blkno;
     desc->stamp_flags      = phdr->flags;
     desc->stamp_meta_offset = phdr->meta_offset;
-    desc->stamp_offsets    = (OffsetNumber *)
-        palloc(sizeof(OffsetNumber) * desc->n_attrs);
-    memcpy(desc->stamp_offsets, phdr->offsets,
-           sizeof(OffsetNumber) * desc->n_attrs);
+    desc->stamp_chunks     = (OffsetNumber *)
+        palloc(sizeof(OffsetNumber) * desc->n_attrs *
+               PAX_CHUNK_ENTRIES_PER_ATTR);
+    memcpy(desc->stamp_chunks, phdr->chunk_head,
+           sizeof(OffsetNumber) * desc->n_attrs * PAX_CHUNK_ENTRIES_PER_ATTR);
 
     /*
      * Tampon des métadonnées de version, dimensionné une fois pour la page.
@@ -2413,28 +2374,18 @@ pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         PaxMinipage      *mp   = &desc->minipages[i];
-        OffsetNumber      off  = phdr->offsets[i];
         MemoryContext     oldc;
-        Size              stride;
-        Size              rsize;
-        Size              used;
-        Size              bmp;
 
         mp->attlen     = attr->attlen;
         mp->attalign   = attr->attalign;
         mp->is_varlena = (attr->attlen < 0);
-        mp->has_nulls  = false;     /* true si un bitmap est présent */
-        mp->null_bitmap = NULL;
+        mp->has_nulls  = true;      /* chaque chunk porte son bitmap */
         mp->n_values   = phdr->n_tuples;
         mp->stride     = pax_slot_stride(attr);
+        mp->chunk_size = pax_chunk_size(mp->stride);
         mp->scratch    = NULL;
-
-        if (!PaxOffsetIsValid(off))
-        {
-            /* colonne jamais écrite sur cette page */
-            mp->data = NULL;
-            continue;
-        }
+        mp->chunks     = NULL;
+        mp->n_chunks   = 0;
 
         /* Tampon de recopie pour les colonnes de longueur fixe passées par
          * référence : elles sont rendues depuis le descripteur et non depuis
@@ -2447,33 +2398,91 @@ pax_build_page_layout(Page page, BlockNumber blkno, TupleDesc tupdesc)
             MemoryContextSwitchTo(oldc);
         }
 
-        stride = mp->stride;
-        rsize  = pax_region_size(page, phdr, desc->n_attrs, i);
-        used   = pax_region_used(desc->n_tuples, stride);
-
-        /*
-         * Le span jusqu'à la région suivante peut dépasser la taille utile :
-         * chaque région s'ouvre alignée sur 8 octets, donc la fin de la
-         * précédente laisse jusqu'à 7 octets de bourrage. Ce qui compte est
-         * que le span puisse contenir la région.
-         */
-        if (rsize < used)
-            elog(ERROR, "pax: inconsistent page layout for column %d "
-                        "(span %zu, besoin %zu = bitmap %zu + %d tuples x %zu)",
-                 i, rsize, used, pax_bitmap_size(desc->n_tuples),
-                 desc->n_tuples, stride);
-
-        bmp = pax_bitmap_size(desc->n_tuples);
-
-        if (bmp > 0)
-        {
-            mp->null_bitmap = (bits8 *) (base + off);
-            mp->has_nulls   = true;
-        }
-        mp->data = base + off + bmp;
+        pax_load_column_chunks(desc, i);
     }
 
     return desc;
+}
+
+/*
+ * Résout la chaîne de chunks d'une colonne et la met en cache.
+ *
+ * La validation est stricte, et elle doit l'être : une chaîne corrompue se
+ * lit silencieusement, puisque le parcours ne touche que des offsets. On
+ * contrôle donc à chaque maillon que l'offset tombe bien dans l'arène, que
+ * le chunk tient entièrement dans l'arène, que n_rows est plausible, et que la
+ * chaîne n'est ni plus longue que n_tuples ne l'exige ni cyclique.
+ *
+ * Ce dernier borne est exact, pas pessimiste : n versions se répartissent sur
+ * ceil(n / PAX_CHUNK_MAX_ROWS) chunks, ce qui vaut n / PAX_CHUNK_MAX_ROWS + 1
+ * lorsque n est un multiple de la taille de chunk et n / PAX_CHUNK_MAX_ROWS + 1
+ * sinon. La borne est donc atteinte pour une chaîne valide, et dépassée par
+ * la première itération d'un cycle.
+ */
+static int
+pax_load_column_chunks(PaxPageDesc *desc, int col)
+{
+    PaxPageHeader *phdr = desc->header;
+    PaxMinipage   *mp   = &desc->minipages[col];
+    char          *base = (char *) desc->page;
+    PageHeader     pghdr = (PageHeader) desc->page;
+    OffsetNumber   off  = phdr->chunk_head[col * PAX_CHUNK_ENTRIES_PER_ATTR];
+    OffsetNumber   tail = phdr->chunk_head[col * PAX_CHUNK_ENTRIES_PER_ATTR + 1];
+    Size           top  = BLCKSZ - SizeOfPaxSpecialData;
+    int            max_chunks;
+    int            n = 0;
+
+    /* Colonne jamais écrite sur cette page : partout NULL. */
+    if (!PaxOffsetIsValid(off))
+        return 0;
+
+    max_chunks = desc->n_tuples / PAX_CHUNK_MAX_ROWS + 1;
+
+    mp->chunks = (OffsetNumber *) MemoryContextAlloc(desc->ctx,
+                                                    sizeof(OffsetNumber) *
+                                                    Max(max_chunks, 1));
+
+    while (PaxOffsetIsValid(off))
+    {
+        PaxChunkHdr *chdr;
+
+        if (n >= max_chunks)
+            elog(ERROR, "pax: chunk chain too long for column %d "
+                        "(%d chunks, %d tuples, %d rows per chunk)",
+                 col, n, desc->n_tuples, PAX_CHUNK_MAX_ROWS);
+
+        if (off < pghdr->pd_upper || off >= top)
+            elog(ERROR, "pax: chunk %d of column %d at offset %u is outside "
+                        "the page arena [%u, %zu)",
+                 n, col, off, pghdr->pd_upper, top);
+
+        if (off + mp->chunk_size > top)
+            elog(ERROR, "pax: chunk %d of column %d overruns the special area "
+                        "(offset %u, size %zu, top %zu)",
+                 n, col, off, mp->chunk_size, top);
+
+        chdr = (PaxChunkHdr *) (base + off);
+
+        if (chdr->n_rows > PAX_CHUNK_MAX_ROWS)
+            elog(ERROR, "pax: chunk %d of column %d claims %u rows, maximum %d",
+                 n, col, chdr->n_rows, PAX_CHUNK_MAX_ROWS);
+
+        mp->chunks[n++] = off;
+        off = chdr->next_chunk;
+    }
+
+    /*
+     * La queue doit désigner le dernier maillon. Sans ce contrôle, une
+     * insertion concurrente qui n'aurait pas encore-chainé son chunk passerait
+     * inaperçue et le maillon deviendrait orphelin.
+     */
+    if (n > 0 && PaxOffsetIsValid(tail) && tail != mp->chunks[n - 1])
+        elog(ERROR, "pax: chunk chain of column %d does not end at its tail "
+                    "(tail %u, last %u)",
+             col, tail, mp->chunks[n - 1]);
+
+    mp->n_chunks = n;
+    return n;
 }
 
 /*
@@ -2508,12 +2517,14 @@ pax_layout_is_current(const PaxPageDesc *desc, Page page, BlockNumber blkno,
         return false;
 
     /*
-     * offsets[] : une insertion concurrente décale les régions en memmove,
-     * donc toute modification invalide les pointeurs mis en cache.
+     * chunk_head[] : un chunk déjà écrit ne bouge jamais, mais une insertion
+     * concurrente peut CHAÎNER un chunk supplémentaire sur une colonne, ce
+     * qui change la longueur de la chaîne. Toute modification invalide donc
+     * la liste mise en cache.
      */
-    for (i = 0; i < desc->n_attrs; i++)
+    for (i = 0; i < desc->n_attrs * PAX_CHUNK_ENTRIES_PER_ATTR; i++)
     {
-        if (desc->stamp_offsets[i] != phdr->offsets[i])
+        if (desc->stamp_chunks[i] != phdr->chunk_head[i])
             return false;
     }
 
@@ -2645,15 +2656,24 @@ pax_build_page_desc(Page page, TupleDesc tupdesc)
 static void
 pax_free_page_desc(PaxPageDesc *desc)
 {
+    int i;
+
     if (desc == NULL)
         return;
 
     if (desc->tuple_meta)
         pfree(desc->tuple_meta);
     if (desc->minipages)
+    {
+        for (i = 0; i < desc->n_attrs; i++)
+        {
+            if (desc->minipages[i].chunks)
+                pfree(desc->minipages[i].chunks);
+        }
         pfree(desc->minipages);
-    if (desc->stamp_offsets)
-        pfree(desc->stamp_offsets);
+    }
+    if (desc->stamp_chunks)
+        pfree(desc->stamp_chunks);
     pfree(desc);
 }
 
@@ -2666,6 +2686,9 @@ pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool *isnull)
 {
     PaxMinipage *mp;
     char        *ptr;
+    char        *chunk;
+    int          ci;
+    int          in_chunk;
 
   /* sécurité contre les valeurs incohérentes */
     Assert(desc != NULL);
@@ -2675,30 +2698,43 @@ pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool *isnull)
   /* récupération de l'attr de la minipage en fn de son num dans le PaxPageDesc */ 
     mp = &desc->minipages[attno];
 
+    if (mp->n_chunks == 0)
+    {
+        /* Colonne jamais écrite sur cette page : NULL partout. */
+        *isnull = true;
+        return (Datum) 0;
+    }
+
+    /*
+     * La valeur vit dans le chunk qui contient cette version. La chaîne a
+     * déjà été parcourue et validée à la construction du descripteur : ici on
+     * ne fait qu'indexer un tableau, sans suivre de pointeur en page.
+     */
+    ci        = pax_chunk_index_of(tupno);
+    in_chunk  = pax_row_in_chunk(tupno);
+    chunk     = (char *) desc->page + mp->chunks[ci];
+
     /*
      * Bitmap de NULL : convention PostgreSQL, bit à 0 = NULL,
      * bit à 1 = valeur présente (att_isnull dans macros  tupmacs.h).
      */
-    if (mp->has_nulls && mp->null_bitmap && att_isnull(tupno, mp->null_bitmap))
+    if (mp->has_nulls && att_isnull(in_chunk, (bits8 *) (chunk +
+                                                         SizeOfPaxChunkHdr)))
     {
         *isnull = true;
         return (Datum) 0;
     }
     *isnull = false;
 
-    if (mp->data == NULL)
-    {
-        *isnull = true;
-        return (Datum) 0;
-    }
+    ptr = chunk + SizeOfPaxChunkHdr +
+        pax_bitmap_size(PAX_CHUNK_MAX_ROWS) +
+        (Size) in_chunk * mp->stride;
 
     /* Longueur fixe : la valeur est lue par memcpy car le slot n'est pas
-     * nécessairement aligné pour son type (les régions sont compactées au
-     * byte près et repoussées par les insertions suivantes). */
+     * nécessairement aligné pour son type (les chunks sont compactés au
+     * byte près et repoussés par les insertions suivantes). */
     if (!mp->is_varlena)
     {
-        ptr = mp->data + ((Size) tupno * mp->stride);
-
         switch (mp->attlen)
         {
             case 1:
@@ -2742,8 +2778,7 @@ pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool *isnull)
     {
         OffsetNumber off;
 
-        memcpy(&off, mp->data + ((Size) tupno * mp->stride),
-               sizeof(OffsetNumber));
+        memcpy(&off, ptr, sizeof(OffsetNumber));
 
         if (!PaxOffsetIsValid(off))
         {
@@ -2785,13 +2820,6 @@ pax_slot_stride(Form_pg_attribute attr)
     return sizeof(OffsetNumber);
 }
 
-/* Taille utile d'une région : bitmap de NULL puis les slots. */
-static Size
-pax_region_used(int n_tuples, Size stride)
-{
-    return pax_bitmap_size(n_tuples) + (Size) n_tuples * stride;
-}
-
 static Size
 pax_bitmap_size(int n_tuples)
 {
@@ -2802,11 +2830,45 @@ pax_bitmap_size(int n_tuples)
 }
 
 /*
+ * Nombre de chunks déjà alloués pour une colonne.
+ *
+ * La longueur de la chaîne n'est pas stockée : elle se déduit du nombre de
+ * versions qu'elle couvre, et se compte donc en parcourant la chaîne. Le
+ * parcours est borné par n_tuples / PAX_CHUNK_MAX_ROWS + 1, donc il reste
+ * court même sur une page pleine, et il ne sert que sur le chemin
+ * d'insertion, déjà sous verrou exclusif.
+ */
+static int
+pax_column_nchunks(Page page, PaxPageHeader *phdr, int col)
+{
+    OffsetNumber   off = phdr->chunk_head[col * PAX_CHUNK_ENTRIES_PER_ATTR];
+    int            n = 0;
+    int            max_chunks;
+
+    if (!PaxOffsetIsValid(off))
+        return 0;
+
+    max_chunks = phdr->n_tuples / PAX_CHUNK_MAX_ROWS + 2;
+
+    while (PaxOffsetIsValid(off))
+    {
+        if (n >= max_chunks)
+            elog(ERROR, "pax: chunk chain of column %d is longer than %d "
+                        "versions allow", col, phdr->n_tuples);
+
+        n++;
+        off = ((PaxChunkHdr *) ((char *) page + off))->next_chunk;
+    }
+
+    return n;
+}
+
+/*
  * Espace requis pour les seules valeurs de longueur variable.
  *
  * C'est la part de l'insertion qui consomme réellement du pd_upper, et la
- * seule part à vérifier pour réutiliser un emplacement UNUSED : les slots et
- * les bits de bitmap existent déjà.
+ * seule part à vérifier pour réutiliser un emplacement UNUSED : le slot et le
+ * bit de bitmap existent déjà, et donc son chunk aussi.
  */
 static Size
 pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
@@ -2832,14 +2894,27 @@ pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
 }
 
 /*
- * Borne inférieure de l'espace requis pour une insertion, servant à
- * interroger le FSM avant de connaître l'état de la page.
+ * Espace demandé au FSM pour trouver une page d'accueil.
  *
- * On prend deliberately le delta de bitmap à zéro, c'est-à-dire le coût d'un
- * ajout sur une page déjà bien remplie : la valeur est donc une borne
- * inférieure, jamais une surestimation. Le FSM propose ainsi au moins tous
- * les candidats réellement utilisables, et la place exacte est revérifiée sous
- * verrou exclusif avant d'écrire.
+ * Contrairement à la version 4, c'est une MAJORATION et non une borne
+ * inférieure, et c'est délibéré : on compte un chunk par colonne, alors
+ * qu'une insertion n'en ouvre un que si elle tombe au-delà des chunks
+ * existants de cette colonne.
+ *
+ * La raison est la terminaison du parcours de sélection. La boucle qui essaie
+ * les pages candidates sort par RecordAndGetPageWithFreeSpace(), qui ne rend
+ * jamais deux fois la même page. Mais elle ne rend InvalidBlockNumber que
+ * lorsqu'aucune page n'a la place demandée. Si cette place était une borne
+ * inférieure, une page disposant d'entre hint et needed octets — cas
+ * ordinaire dès qu'une colonne doit ouvrir un chunk — serait proposée, rejetée
+ * sous le verrou exclusif, rendue, puis re-proposée indéfiniment. C'est
+ * exactement le plantage observé : l'UPDATE ne finissait pas.
+ *
+ * En majorant, le FSM ne propose que des pages qui conviennent même dans le
+ * pire cas, donc le parcours se termine toujours. Le prix est un
+ * remplissage légèrement moins dense, borné à un chunk par colonne et par
+ * ligne insérée, donc à environ 1/PAX_CHUNK_MAX_ROWS de la place par colonne
+ * pour les pages déjà bien remplies.
  */
 static Size
 pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
@@ -2853,7 +2928,8 @@ pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-        need += pax_slot_stride(attr);
+        /* Le chunk que cette colonne ouvrirait au pire. */
+        need += pax_chunk_size(pax_slot_stride(attr));
 
         if (isnulls[i] || attr->attlen >= 0)
             continue;
@@ -2869,20 +2945,23 @@ pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
 }
 
 /*
- * Espace (borne supérieure) exigé pour insérer ce tuple dans une page qui
- * contient déjà "tupno" tuples.
+ * Espace (borne supérieure) exigé pour insérer ce tuple en position "tupno"
+ * d'une page.
  *
- * "phdr" permet de ne provisionner que ce qui concerne les colonnes
- * réellement absentes de la page ; passer NULL revient à supposer qu'aucune
- * région n'existe encore (page neuve).
+ * Le format v5 ne coûte plus, par ligne, un slot par colonne : un chunk
+ * contient PAX_CHUNK_MAX_ROWS slots et ne bouge plus. L'espace dépend donc de
+ * si la version tombe DANS un chunk existant ou en ouvre un nouveau, ce qui
+ * ne se sait qu'en comptant les chunks de la colonne.
+ *
+ * Passer page = NULL revient à supposer la page neuve : toutes les colonnes
+ * ouvrent alors leur premier chunk, qui est le cas le plus coûteux.
  */
 static Size
 pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls,
-                        int tupno, PaxPageHeader *phdr)
+                        int tupno, Page page, PaxPageHeader *phdr)
 {
     TupleDesc   tupdesc = RelationGetDescr(rel);
-    Size        bitmap_delta = pax_bitmap_size(tupno + 1) -
-        pax_bitmap_size(tupno);
+    int         want_chunk = pax_chunk_index_of(tupno);
     Size        need = SizeOfPaxTupleMetaData;
     Size        amount;
     int         i;
@@ -2891,12 +2970,20 @@ pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls,
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-        amount = pax_slot_stride(attr) + bitmap_delta;
-        if (amount > MaxAllocSize - need)
-            ereport(ERROR,
-                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                     errmsg("pax: row size exceeds supported limits")));
-        need += amount;
+        /*
+         * Un chunk neuf n'est nécessaire que si la version tombe au-delà des
+         * chunks déjà alloués pour cette colonne. Sinon le slot existe.
+         */
+        if (page == NULL ||
+            pax_column_nchunks(page, phdr, i) <= want_chunk)
+        {
+            amount = pax_chunk_size(pax_slot_stride(attr));
+            if (amount > MaxAllocSize - need)
+                ereport(ERROR,
+                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                         errmsg("pax: row size exceeds supported limits")));
+            need += amount;
+        }
 
         if (isnulls[i] || attr->attlen >= 0)
             continue;
@@ -2921,16 +3008,84 @@ pax_insert_space_needed(Relation rel, Datum *values, bool *isnulls,
 }
 
 /*
- * Alloue la représentation « en haut de page » (pd_upper descendante) d'une
- * valeur variable.  Renvoie InvalidOffsetNumber si la page est pleine.
+ * Taille d'un chunk de colonne, pour un pas donné.
+ *
+ * Elle ne dépend QUE du pas, jamais du nombre de versions déjà présentes :
+ * c'est ce qui rend le chunk allouable une fois pour toutes, et donc
+ * immobile. Le bitmap est dimensionné pour PAX_CHUNK_MAX_ROWS, jamais pour le
+ * nombre courant de versions : le lecteur et l'écrivain n'ont donc aucune
+ * taille à s'accorder, ce qui était une source de bogues en version 4.
+ */
+static Size
+pax_chunk_size(Size stride)
+{
+    return SizeOfPaxChunkHdr + pax_bitmap_size(PAX_CHUNK_MAX_ROWS) +
+        (Size) PAX_CHUNK_MAX_ROWS * stride;
+}
+
+/*
+ * Alloue un bloc de "size" octets dans l'arène, par pd_upper décroissante
+ * comme en version 4.
+ *
+ * Le bloc obtenu est aligné sur 8 octets comme ses voisins, et surtout il NE
+ * BOUGE PLUS : c'est tout l'intérêt du découpage, et la raison pour laquelle
+ * un chunk est alloué à sa taille définitive dès la première version qui
+ * l'ouvre.
  */
 static OffsetNumber
-pax_alloc_payload(Page page, Datum value, int16 attlen)
+pax_alloc_chunk(Page page, PaxPageHeader *phdr, Size size)
+{
+    PageHeader      pagehdr = (PageHeader) page;
+    Size            aligned_len = MAXALIGN(size);
+    OffsetNumber    off;
+
+    if ((Size) (pagehdr->pd_upper - pagehdr->pd_lower) < aligned_len)
+        return InvalidOffsetNumber;
+
+    pagehdr->pd_upper -= (LocationIndex) aligned_len;
+    off = (OffsetNumber) pagehdr->pd_upper;
+
+    Assert((LocationIndex) off >= pagehdr->pd_lower);
+    Assert((LocationIndex) off + aligned_len <=
+           (LocationIndex) (BLCKSZ - SizeOfPaxSpecialData));
+
+    memset((char *) page + off, 0, aligned_len);
+
+    /* La descente lowers the floor too : c'est la borne du compactage. */
+    if (off < phdr->chunk_floor)
+        phdr->chunk_floor = off;
+
+    return off;
+}
+
+/* Index du chunk qui contient la version "tupno". */
+static int
+pax_chunk_index_of(int tupno)
+{
+    return tupno / PAX_CHUNK_MAX_ROWS;
+}
+
+/* Rang de la version "tupno" à l'intérieur de son chunk. */
+static int
+pax_row_in_chunk(int tupno)
+{
+    return tupno % PAX_CHUNK_MAX_ROWS;
+}
+
+/*
+ * Alloue la représentation d'une valeur de longueur variable dans l'arène,
+ * par pd_upper décroissante, exactement comme en version 4.
+ * Renvoie InvalidOffsetNumber si la page est pleine.
+ */
+static OffsetNumber
+pax_alloc_payload(Page page, PaxPageHeader *paxhdr, Datum value, int16 attlen)
 {
     PageHeader      phdr = (PageHeader) page;
     Size            len;
     Size            aligned_len;
     OffsetNumber    off;
+
+    Assert(paxhdr == PaxPageHeaderPtr(page));
 
     if (attlen == -2)
         len = strlen(DatumGetPointer(value)) + 1;
@@ -2945,30 +3100,23 @@ pax_alloc_payload(Page page, Datum value, int16 attlen)
     phdr->pd_upper -= (LocationIndex) aligned_len;
     off = (OffsetNumber) phdr->pd_upper;
 
+    Assert(phdr->pd_upper >= phdr->pd_lower);
+    Assert(phdr->pd_upper <= (LocationIndex) (BLCKSZ - SizeOfPaxSpecialData));
+
     memcpy((char *) page + off, DatumGetPointer(value), len);
     return off;
 }
 
-/* Taille de la région de colonne i : elle va jusqu'à la région suivante,
- * ou jusqu'à pd_lower si c'est la dernière. */
-static Size
-pax_region_size(Page page, PaxPageHeader *phdr, int n_attrs, int i)
-{
-    LocationIndex start = phdr->offsets[i];
-    LocationIndex end;
 
-    Assert(PaxOffsetIsValid(start));
-
-    if (i + 1 < n_attrs && PaxOffsetIsValid(phdr->offsets[i + 1]))
-        end = phdr->offsets[i + 1];
-    else
-        end = ((PageHeader) page)->pd_lower;
-
-    Assert(end >= start);
-    return (Size) (end - start);
-}
-
-/* Espace libre réel : entre la fin des régions et les valeurs en haut. */
+/*
+ * Espace libre réel : le trou entre la fin de la zone basse (pd_lower) et le
+ * bas de l'arène (pd_upper).
+ *
+ * Il se lit comme en version 4, et c'est bien la seule quantité comparable à
+ * la somme des besoins d'une insertion : chunks et charges utiles se
+ * partagent la même descente, donc leurs besoins s'additionnent dans ce même
+ * trou.
+ */
 static Size
 pax_page_free_space(Page page)
 {
@@ -2977,67 +3125,24 @@ pax_page_free_space(Page page)
     return (Size) (phdr->pd_upper - phdr->pd_lower);
 }
 
-/* Transaction metadata ends at the first user region (or pd_lower). */
+/*
+ * Taille de la région des métadonnées de version.
+ *
+ * Elle occupe toute la zone basse, de meta_offset à pd_lower : en version 5
+ * il n'y a plus de régions de colonnes en dessous, donc plus rien dont il
+ * faudrait connaître l'offset.
+ */
 static Size
 pax_meta_region_size(Page page, PaxPageHeader *phdr)
 {
-    PaxSpecialData *special;
     LocationIndex start = phdr->meta_offset;
-    LocationIndex end;
+    LocationIndex end = ((PageHeader) page)->pd_lower;
 
     Assert(PaxOffsetIsValid(start));
-
-    special = (PaxSpecialData *) PageGetSpecialPointer(page);
-    if (special->n_attrs > 0 && PaxOffsetIsValid(phdr->offsets[0]))
-        end = phdr->offsets[0];
-    else
-        end = ((PageHeader) page)->pd_lower;
 
     if (end < start)
         elog(ERROR, "pax: invalid transaction metadata region");
     return (Size) (end - start);
-}
-
-
-/*
- * Insère "len" octets à la position absolue "at" en décalant tout ce qui
- * suit vers la droite.  Les régions qui commencent à "at" ou après sont
- * décalées, sauf celle qu'on remplit (region_idx).
- *
- * C'est ce décalage qui permet à une colonne de grandir sans quitter sa
- * région : les zones de haut niveau (bitmap de pd_upper) ne sont pas
- * touchées car on ne déplace que [at, pd_lower[.
- *
- * "len" n'est plus forcément multiple de 8 : insérer un slot vaut strlen,
- * soit 2 ou 4 octets. C'est sans conséquence, les lectures se faisant par
- * memcpy.
- */
-static void
-pax_insert_bytes(Page page, PaxPageHeader *phdr, int n_attrs,
-                 int region_idx, Size at, Size len)
-{
-    PageHeader  hdr = (PageHeader) page;
-    int         j;
-
-    Assert(at <= (Size) hdr->pd_lower);
-
-    if (hdr->pd_lower > hdr->pd_upper ||
-        len > (Size) (hdr->pd_upper - hdr->pd_lower))
-        elog(ERROR, "pax: page has no space for %zu bytes", len);
-
-    if (len > 0)
-        memmove((char *) page + at + len, (char *) page + at,
-                (Size) hdr->pd_lower - at);
-
-    hdr->pd_lower += (LocationIndex) len;
-
-    for (j = 0; j < n_attrs; j++)
-    {
-        if (j == region_idx)
-            continue;
-        if (PaxOffsetIsValid(phdr->offsets[j]) && phdr->offsets[j] >= at)
-            phdr->offsets[j] = (OffsetNumber) (phdr->offsets[j] + len);
-    }
 }
 
 static bool
@@ -3983,7 +4088,7 @@ static void
 pax_tuple_insert(Relation rel, TupleTableSlot *slot,
                  CommandId cid, uint32 options,
                  BulkInsertState bistate)
-#else 
+#else
 static void
 pax_tuple_insert(Relation rel, TupleTableSlot *slot,
                  CommandId cid, int options,
@@ -4136,7 +4241,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
         /* n_tuples lu APRÈS le lock : l'état peut avoir changé */
         h          = PaxPageHeaderPtr(p);
         needed     = pax_insert_space_needed(rel, values, isnulls, h->n_tuples,
-                                             h);
+                                             p, h);
         free_space = pax_page_free_space(p);
 
         if (free_space >= needed)
@@ -4187,7 +4292,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     if (page_is_new)
     {
         pax_page_init(page, natts);
-        needed = pax_insert_space_needed(rel, values, isnulls, 0, NULL);
+        needed = pax_insert_space_needed(rel, values, isnulls, 0, NULL, NULL);
         available = pax_page_free_space(page);
         if (available < needed)
         {
@@ -4209,20 +4314,20 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     /*
      * Cherche un emplacement libéré par VACUUM pour le réutiliser.
      *
-     * Un emplacement UNUSED conserve déjà son slot dans chaque région et son
+     * Un emplacement UNUSED conserve déjà son slot dans chaque chunk et son
      * bit dans chaque bitmap : il suffit donc de réécrire les valeurs par
-     * dessus, sans étendre ni les régions ni les métadonnées. C'est ce qui
+     * dessus, sans allouer de chunk ni étendre les métadonnées. C'est ce qui
      * rend la place récupérée par le vacuum utilisable en place.
      *
-     * On ne réutilise que si la page possède déjà toutes les régions de
-     * colonnes : une colonne absente (jamais écrite sur cette page, donc NULL
-     * partout) n'a pas de slot à réutiliser et devrait en créer un, ce qui
-     * exigerait d'agrandir la page — autant ajouter une version à la fin.
+     * On ne réutilise que si la page possède déjà un chunk pour chaque
+     * colonne : une colonne absente (jamais écrite sur cette page, donc NULL
+     * partout) n'a pas de slot à réutiliser, et lui en créer un agrandirait
+     * la page — autant ajouter une version à la fin.
      *
-     * Les valeurs variables restent allouées en haut de page et consomment
-     * donc de la place : la réutilisation n'est possible que si la page a la
-     * place pour ces seules valeurs, ce que pax_payload_space_needed()
-     * calcule. On vérifie cela AVANT de commiter le choix.
+     * Les valeurs variables restent allouées dans l'arène et consomment donc
+     * de la place : la réutilisation n'est possible que si la page a la place
+     * pour ces seules valeurs, ce que pax_payload_space_needed() calcule. On
+     * vérifie cela AVANT de commiter le choix.
      */
     reusing = false;
     if (phdr->n_tuples > 0)
@@ -4232,7 +4337,7 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
         for (c = 0; c < natts; c++)
         {
-            if (!PaxOffsetIsValid(phdr->offsets[c]))
+            if (!PaxOffsetIsValid(phdr->chunk_head[c * PAX_CHUNK_ENTRIES_PER_ATTR]))
                 break;
         }
         if (c == natts)
@@ -4270,23 +4375,15 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
                         BufferGetBlockNumber(buf))));
     }
 
-    /* === 2. Valeurs variables : en haut de page, avant tout décalage === */
-    for (i = 0; i < natts; i++)
-    {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-
-        if (isnulls[i] || attr->attlen >= 0)
-            continue;
-
-        voffs[i] = pax_alloc_payload(page, values[i], attr->attlen);
-        if (!PaxOffsetIsValid(voffs[i]))
-            elog(ERROR, "pax: no space left in page for a variable-length value "
-                        "(free %zu, attlen %d, pd_lower %u, pd_upper %u, n_tuples %d)",
-                 pax_page_free_space(page), attr->attlen,
-                 pghdr->pd_lower, pghdr->pd_upper, phdr->n_tuples);
-    }
-
-    /* === 3. Transaction metadata: one fixed record per tuple === */
+    /*
+     * === 2. Métadonnées de version : la zone basse ===
+     *
+     * Cette étape précède l'allocation des charges utiles, et l'ordre est
+     * obligatoire. pd_lower monte depuis meta_offset, et la zone des charges
+     * utiles se construit à partir de pd_upper : allouer une charge utile
+     * d'abord lui prendrait l'espace que les métadonnées doivent prendre,
+     * et il ne resterait plus de quoi écrire ces 32 octets.
+     */
     if (!PaxOffsetIsValid(phdr->meta_offset))
         elog(ERROR, "pax: missing transaction metadata region");
 
@@ -4306,13 +4403,58 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
 
     /*
      * En réutilisation, l'emplacement 32 octets existe déjà : on le
-     * réécrit sur place. Sinon on insère les octets, ce qui décale les
-     * versions suivantes et les régions.
+     * réécrit sur place. Sinon on agrandit simplement la zone basse.
+     *
+     * Aucun memmove n'est nécessaire, et c'est le second bénéfice du format
+     * v5 : la zone basse ne contient QUE des enregistrements de métadonnées,
+     * aucun pointeur n'y est rangé, donc rien à corriger après un
+     * décalage, là où la version 4 devait corriger offsets[] à chaque
+     * insertion.
      */
     if (!reusing)
-        pax_insert_bytes(page, phdr, natts, PAX_NO_REGION, meta_at,
-                         SizeOfPaxTupleMetaData);
+    {
+        Assert(meta_at == (Size) pghdr->pd_lower);
 
+        /*
+         * Aucun octet n'est déplacé : la zone basse ne contient que des
+         * enregistrements de métadonnées, et aucun pointeur n'y est rangé. En
+         * version 4, pd_lower remontait par memmove et il fallait corriger
+         * offsets[] derrière lui, ce qui déplaçait les slots — et c'était
+         * précisément ce qui rendait la matérialisation paresseuse impossible.
+         */
+        pghdr->pd_lower += (LocationIndex) SizeOfPaxTupleMetaData;
+    }
+
+    /*
+     * === 3. Valeurs variables : la zone des charges utiles ===
+     *
+     * Elles se rangent à partir de pd_upper, qui MONTE, donc SOUS les chunks.
+     * C'est l'inverse de la version 4, où pd_upper descendait depuis le sommet
+     * de page : le sens est changé précisément pour réserver aux charges utiles
+     * une plage distincte de celle des chunks.
+     */
+    for (i = 0; i < natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+        if (isnulls[i] || attr->attlen >= 0)
+            continue;
+
+        voffs[i] = pax_alloc_payload(page, phdr, values[i], attr->attlen);
+        if (!PaxOffsetIsValid(voffs[i]))
+            elog(ERROR, "pax: no space left in page for a variable-length value "
+                        "(free %zu, attlen %d, pd_lower %u, pd_upper %u, "
+                        "n_tuples %d)",
+                 pax_page_free_space(page), attr->attlen,
+                 pghdr->pd_lower, pghdr->pd_upper,
+                 phdr->n_tuples);
+    }
+
+    /*
+     * Renseigne l'enregistrement de métadonnées. Il est réécrit intégralement,
+     * y compris en réutilisation, puisqu'une version UNUSED garde son
+     * emplacement mais doit repartir de zéro.
+     */
     meta = ((PaxTupleMetaData *) ((char *) page + phdr->meta_offset)) + tupno;
     memset(meta, 0, SizeOfPaxTupleMetaData);
     meta->xmin = xmin;
@@ -4321,66 +4463,131 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
     meta->cmax = InvalidCommandId;
     meta->locker_mxid = InvalidMultiXactId;
 
-    /* === 4. Une région par colonne : [bitmap de NULL][valeurs] === */
+    /*
+     * === 4. Une chaîne de chunks par colonne : [en-tête][bitmap][slots] ===
+     *
+     * C'est ici que se joue la stabilité d'adresse. Un chunk est alloué une
+     * seule fois, à sa taille définitive, et plus rien ne le déplace
+     * ensuite : la version qu'il contient garde donc une adresse stable, ce
+     * qui manquait à la version 4, où la table des slots était remontée par
+     * memmove à chaque insertion.
+     *
+     * Le chunk à écrire est celui d'indice tupno / PAX_CHUNK_MAX_ROWS. S'il
+     * existe déjà, on y entre directement ; sinon on l'alloue et on le
+     * chaîne au dernier de la colonne. En réutilisation d'un emplacement
+     * UNUSED, le chunk existe nécessairement : le slot y est déjà.
+     */
     for (i = 0; i < natts; i++)
     {
         Form_pg_attribute attr   = TupleDescAttr(tupdesc, i);
         Size              stride = pax_slot_stride(attr);
-        Size              region_start;
-        Size              cur;        /* taille actuelle du bitmap */
-        Size              want;       /* taille voulue du bitmap */
-        Size              at;
+        int               want_chunk = pax_chunk_index_of(tupno);
+        int               in_chunk = pax_row_in_chunk(tupno);
+        int               have;
+        OffsetNumber      chunk_off;
+        char             *chunk;
         bits8            *bmp;
+        Size              at;
+        int               k;
 
-        /*
-         * Première écriture de cette colonne : la région s'ouvre à la fin de
-         * la zone des régions (pd_lower), au byte près. Aucune contrainte
-         * d'alignement n'est posée ici : les lectures passent par memcpy
-         * (voir pax_get_value), donc un slot déaligné reste correct.
-         */
-        if (!PaxOffsetIsValid(phdr->offsets[i]))
-            phdr->offsets[i] = (OffsetNumber) pghdr->pd_lower;
+        have = pax_column_nchunks(page, phdr, i);
 
-        region_start = phdr->offsets[i];
-
-        /* 3a) le bitmap doit couvrir le bit "tupno" (0 = NULL, 1 = valeur).
-         * Sa taille se déduit du nombre de versions, et non du span de la
-         * région : le bourrage d'alignement rend le span non canonique. */
-        cur  = pax_bitmap_size(tupno);
-        want = reusing ? cur : pax_bitmap_size(tupno + 1);
-        if (want > cur)
+        if (want_chunk >= have)
         {
-            at = region_start + cur;
-            pax_insert_bytes(page, phdr, natts, i, at, want - cur);
-            memset((char *) page + at, 0, want - cur);
+            PaxChunkHdr *chdr;
+            OffsetNumber new_off;
+
+            new_off = pax_alloc_chunk(page, phdr, pax_chunk_size(stride));
+            if (!PaxOffsetIsValid(new_off))
+                elog(ERROR, "pax: no space left in page for a chunk of column %d "
+                            "(free %zu, needed %zu, pd_lower %u, pd_upper %u, "
+                            "n_tuples %d)",
+                     i, pax_page_free_space(page), pax_chunk_size(stride),
+                     pghdr->pd_lower, pghdr->pd_upper,
+                     phdr->n_tuples);
+
+            chdr = (PaxChunkHdr *) ((char *) page + new_off);
+            chdr->next_chunk = InvalidOffsetNumber;
+            chdr->n_rows = 0;
+
+            /*
+             * Chaînage. Premier chunk : il devient la tête. Sinon il suit le
+             * dernier maillon, dont l'adresse ne bougera donc jamais non plus.
+             */
+            if (have == 0)
+                phdr->chunk_head[i * PAX_CHUNK_ENTRIES_PER_ATTR] = new_off;
+            else
+            {
+                OffsetNumber prev = phdr->chunk_head[i * PAX_CHUNK_ENTRIES_PER_ATTR];
+
+                for (k = 0; k < have - 1; k++)
+                {
+                    chdr = (PaxChunkHdr *) ((char *) page + prev);
+                    if (!PaxOffsetIsValid(chdr->next_chunk))
+                        elog(ERROR, "pax: chunk chain of column %d ends after "
+                                    "%d chunks, expected %d", i, k, have - 1);
+                    prev = chdr->next_chunk;
+                }
+                chdr = (PaxChunkHdr *) ((char *) page + prev);
+                if (PaxOffsetIsValid(chdr->next_chunk))
+                    elog(ERROR, "pax: chunk chain of column %d is longer than "
+                                "its %d chunks", i, have);
+chdr->next_chunk = new_off;
+            }
+
+            /* La queue suit toujours le dernier maillon. */
+            phdr->chunk_head[i * PAX_CHUNK_ENTRIES_PER_ATTR + 1] = new_off;
         }
-        bmp = (bits8 *) ((char *) page + region_start);
 
         /*
-         * 3b) réserver l'emplacement de la valeur dans la région. En
-         * réutilisation le slot existe déjà, on n'insère rien ; seule la
-         * valeur est réécrite par-dessus.
-         *
-         * La base de la table des valeurs est la taille RÉELLE du bitmap, pas
-         * celle que l'insertion est en train de construire. En ajout simple
-         * les deux coïncident (want vient d'être atteint). En réutilisation
-         * elles diffèrent : tupno < n_tuples, donc pax_bitmap_size(tupno)
-         * serait trop petit, et l'offset partirait dans le milieu de la
-         * table existante, décalant tous les emplacements suivants. C'est
-         * ici que se lit le bitmap à la lecture (pax_build_page_layout),
-         * donc il faut exactement la même valeur.
+         * Retrouve le chunk cible : il existe désormais dans tous les cas.
+         * Le parcours se refait ici plutôt que de le mémoriser, parce que le
+         * chaînage vient de modifier la page.
          */
-        at = region_start +
-            pax_bitmap_size(reusing ? phdr->n_tuples : tupno + 1) +
-            (Size) tupno * stride;
-        if (!reusing)
-            pax_insert_bytes(page, phdr, natts, i, at, stride);
+        chunk_off = phdr->chunk_head[i * PAX_CHUNK_ENTRIES_PER_ATTR];
+        for (k = 0; k < want_chunk; k++)
+        {
+            PaxChunkHdr *chdr = (PaxChunkHdr *) ((char *) page + chunk_off);
 
-        /* 3c) positionner le bit, puis écrire la valeur */
+            if (!PaxOffsetIsValid(chdr->next_chunk))
+                elog(ERROR, "pax: chunk chain of column %d ends before chunk %d",
+                     i, want_chunk);
+            chunk_off = chdr->next_chunk;
+        }
+
+        chunk = (char *) page + chunk_off;
+
+        /*
+         * n_rows ne sert qu'à la validation à la lecture ; il doit couvrir la
+         * version qu'on écrit. En réutilisation il est déjà assez grand, donc
+         * la comparaison seule suffit.
+         */
+        {
+            PaxChunkHdr *chdr = (PaxChunkHdr *) chunk;
+
+            if (in_chunk + 1 > chdr->n_rows)
+                chdr->n_rows = (uint16) (in_chunk + 1);
+        }
+
+        /* 4a) le bit de NULL de CETTE version, dans le bitmap du chunk. */
+        bmp = (bits8 *) (chunk + SizeOfPaxChunkHdr);
+
+        /*
+         * 4b) l'emplacement du slot. La base est la taille du bitmap pour
+         * PAX_CHUNK_MAX_ROWS, jamais pour le nombre courant de versions :
+         * chunk et lecteur n'ont ainsi aucune taille à s'accorder, et c'est
+         * ce qui avait produit le décalage de slots du bug « id=26 renvoyant
+         * r30 » en version 4.
+         */
+        at = (Size) chunk_off + SizeOfPaxChunkHdr +
+            pax_bitmap_size(PAX_CHUNK_MAX_ROWS) + (Size) in_chunk * stride;
+
+
+        /* 4c) positionner le bit, puis écrire la valeur */
         if (isnulls[i])
-            bmp[tupno >> 3] &= (bits8) ~(1 << (tupno & 0x07));
+            bmp[in_chunk >> 3] &= (bits8) ~(1 << (in_chunk & 0x07));
         else
-            bmp[tupno >> 3] |= (bits8) (1 << (tupno & 0x07));
+            bmp[in_chunk >> 3] |= (bits8) (1 << (in_chunk & 0x07));
 
         if (isnulls[i])
             memset((char *) page + at, 0, stride);

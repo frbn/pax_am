@@ -613,7 +613,7 @@ SELECT (SELECT count(*) FROM tpax_reuse) AS rows_after_reuse,
          AS space_reclaimed;
  rows_after_reuse | mismatched | pages_before | pages_after | space_reclaimed 
 ------------------+------------+--------------+-------------+-----------------
-            35000 |          0 |          234 |         234 | t
+            35000 |          0 |          348 |         348 | t
 (1 row)
 
 -- Reusing a slot must not resurrect the metadata of the version it replaced:

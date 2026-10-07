@@ -2,7 +2,7 @@
 """
 Inspecte une page PAX reelle et emet un schema SVG fidele aux octets lus.
 
-Les structures decodees correspondent exactement a pax_am.c (format v3) :
+Les structures decodees correspondent exactement a pax_am.c (format v5) :
 
   PageHeaderData (24 o)          storage/bufpage.h
     pd_lsn 8, pd_checksum 2, pd_flags 2, pd_lower 2,
@@ -12,13 +12,20 @@ Les structures decodees correspondent exactement a pax_am.c (format v3) :
     PaxPageHeaderPtr = page + SizeOfPageHeaderData + SizeOfPaxSpecialData
 
   PaxPageHeader
-    n_tuples 2, meta_offset 2, free_space 2, flags 2, offsets[n_attrs] 2
+    n_tuples 2, meta_offset 2, free_space 2, flags 2,
+    chunk_floor 2, chunk_head[2 x n_attrs] 2
 
   PaxTupleMetaData : 32 o par version
     xmin 4, xmax 4, cmin 4, cmax 4, t_ctid 6, flags 2, locker_mxid 4, pad 4
 
-  region par colonne : [bitmap de NULL][slots]
-    v4 : slot = attlen si longueur fixe, 2 o si varlena
+  Chunks, dans l'arene au-dessus de pd_upper, un par tranche de
+  PAX_CHUNK_MAX_ROWS versions :
+    PaxChunkHdr : next_chunk 2, n_rows 2   (8 o avec l'alignement)
+    puis bitmap de NULL (toujours dimensionne pour PAX_CHUNK_MAX_ROWS)
+    puis PAX_CHUNK_MAX_ROWS slots
+
+  Un chunk alloue ne bouge plus : c'est ce qui donne a une ligne PAX une
+  adresse stable.
 
   PaxSpecialData (8 o) en fin de page
     version 2, flags 2, n_attrs 2, magic 2
@@ -37,7 +44,10 @@ BLCKSZ = 8192
 SIZEOF_PAGE_HEADER = 24
 SIZEOF_PAX_SPECIAL = 8
 SIZEOF_TUPLE_META = 32
-PAX_HEADER_FIXED = 8
+PAX_HEADER_FIXED = 10
+
+# Doit etre maintenu en accord avec PAX_CHUNK_MAX_ROWS de pax_am.c.
+PAX_CHUNK_MAX_ROWS = 64
 
 
 def maxalign(n):
@@ -51,7 +61,7 @@ def bitmap_size(n):
 
 
 def slot_stride(attlen):
-    """v4 : pas exact = attlen, ou 2 octets pour un varlena (OffsetNumber)."""
+    """Pas exact du slot = attlen, ou 2 octets pour un varlena (OffsetNumber)."""
     return attlen if attlen and attlen > 0 else 2
 
 
@@ -71,7 +81,9 @@ def fetch_columns(psql, db, relation):
                    f"SELECT attnum, attname, attlen FROM pg_attribute "
                    f"WHERE attrelid = '{relation}'::regclass AND attnum > 0 "
                    f"AND NOT attisdropped ORDER BY attnum").splitlines()
-    return [dict(attnum=int(a), name=b, attlen=int(c)) for a, b, c in
+    # attnum est 1-based dans le catalogue : on le rebascule en index de colonne,
+    # ce qui est la base des chaines de chunks et des slots.
+    return [dict(attnum=int(a) - 1, name=b, attlen=int(c)) for a, b, c in
             (r.split("|") for r in rows)]
 
 
@@ -83,14 +95,16 @@ def parse_page(page):
 
     base = SIZEOF_PAGE_HEADER + SIZEOF_PAX_SPECIAL
     p["pax_header_off"] = base
-    p["n_tuples"], p["meta_offset"], p["free_space"], p["pax_flags"] = \
-        struct.unpack_from("<HHHH", page, base)
+    p["n_tuples"], p["meta_offset"], p["free_space"], p["pax_flags"], \
+        p["chunk_floor"] = struct.unpack_from("<HHHHH", page, base)
 
     p["special_version"], p["special_flags"], p["n_attrs"], p["special_magic"] = \
         struct.unpack_from("<HHHH", page, p["pd_special"])
 
-    p["offsets"] = list(struct.unpack_from("<%dH" % p["n_attrs"], page, base + PAX_HEADER_FIXED))
-    p["pax_header_size"] = maxalign(PAX_HEADER_FIXED + p["n_attrs"] * 2)
+    n = p["n_attrs"] * 2
+    p["chunk_head"] = list(struct.unpack_from("<%dH" % n, page, base + PAX_HEADER_FIXED))
+    p["pax_header_size"] = maxalign(PAX_HEADER_FIXED + n * 2)
+    p["meta_end"] = p["pd_lower"]
 
     p["meta"] = []
     for i in range(p["n_tuples"]):
@@ -105,27 +119,69 @@ def parse_page(page):
         p["meta"].append(dict(xmin=xmin, xmax=xmax, cmin=cmin, cmax=cmax,
                               blk=blk, off=off, flags=flags, mxid=mxid, pad=pad))
 
-    p["regions"] = []
+    # Chaines de chunks, une par colonne. La taille d'un chunk se deduit du
+    # pas de sa colonne, donc il faut connaître le descripteur : on la laisse
+    # nulle ici et verify_layout() la recalcule depuis cols.
+    p["chains"] = []
     for i in range(p["n_attrs"]):
-        s = p["offsets"][i]
-        if s in (0xFFFF, 0):
-            p["regions"].append(None)
-            continue
-        if i + 1 < p["n_attrs"] and p["offsets"][i + 1] not in (0xFFFF, 0):
-            e = p["offsets"][i + 1]
-        else:
-            e = p["pd_lower"]
-        p["regions"].append(dict(attnum=i, start=s, end=e, size=e - s))
+        off = p["chunk_head"][i * 2]
+        tail = p["chunk_head"][i * 2 + 1]
+        chain = []
+        seen = set()
+        while off not in (0xFFFF, 0):
+            if off in seen:
+                break                      # cycle : on s'arrete
+            seen.add(off)
+            nxt, nrows = struct.unpack_from("<HH", page, off)
+            chain.append(dict(off=off, next=nxt, n_rows=nrows, size=0))
+            off = nxt
+        p["chains"].append(dict(chain=chain, tail=tail))
 
-    p["meta_end"] = p["regions"][0]["start"] if p["regions"] and p["regions"][0] else p["pd_lower"]
     return p
 
 
-def null_count(page, p, reg, attlen):
-    bmp = reg["size"] - p["n_tuples"] * slot_stride(attlen)
-    if bmp <= 0:
+def chunk_size(stride):
+    """Taille d'un chunk : en-tete + bitmap plein + PAX_CHUNK_MAX_ROWS slots.
+
+    Elle ne depend que du PAS de la colonne, jamais du nombre de versions
+    deja presentes : c'est ce qui permet d'allouer un chunk une fois pour
+    toutes, a sa taille definitive.
+    """
+    return 8 + bitmap_size(PAX_CHUNK_MAX_ROWS) + PAX_CHUNK_MAX_ROWS * stride
+
+
+def chunk_of(p, col, tupno):
+    """Renvoie (chunk, rang dans le chunk) pour une version d'une colonne."""
+    chain = p["chains"][col]["chain"]
+    if not chain:
+        return None, 0
+    ci = tupno // PAX_CHUNK_MAX_ROWS
+    if ci >= len(chain):
+        return None, 0
+    return chain[ci], tupno % PAX_CHUNK_MAX_ROWS
+
+
+def slot_offset(p, col, stride, tupno):
+    """Offset absolu du slot d'une version, ou None si la colonne est absente."""
+    ch, in_chunk = chunk_of(p, col, tupno)
+    if ch is None:
+        return None
+    return ch["off"] + 8 + bitmap_size(PAX_CHUNK_MAX_ROWS) + in_chunk * stride
+
+
+def is_null_row(page, p, col, tupno):
+    """Bit de NULL de cette version, dans le bitmap de SON chunk."""
+    ch, in_chunk = chunk_of(p, col, tupno)
+    if ch is None:
+        return True
+    bmp = ch["off"] + 8
+    return not (page[bmp + in_chunk // 8] & (1 << (in_chunk % 8)))
+
+
+def null_count(page, p, col, attlen):
+    if not p["chains"][col]["chain"]:
         return 0
-    return sum(1 for t in range(p["n_tuples"]) if is_null(page, reg, t))
+    return sum(1 for t in range(p["n_tuples"]) if is_null_row(page, p, col, t))
 
 
 def decode_fixed(page, off, attlen):
@@ -138,14 +194,7 @@ def decode_fixed(page, off, attlen):
     return None
 
 
-def is_null(page, reg, t):
-    """
-    Lit le bit de NULL du bitmap de la region.
 
-    pax_am.c utilise att_isnull() de tupmacs.h : convention PostgreSQL,
-    bit a 0 = NULL, bit a 1 = valeur presente.
-    """
-    return not (page[reg["start"] + t // 8] & (1 << (t % 8)))
 
 
 def decode_varlena(page, off):
@@ -192,13 +241,15 @@ def collect_varlena(page, p, colinfo, limit=4):
     """Récupère les valeurs varlena réellement référencées par les slots."""
     seen = {}
     for c in colinfo:
-        if c["attlen"] > 0 or c["reg"] is None:
+        if c["attlen"] > 0 or not c["chain"]:
             continue
-        reg, stride, bmp = c["reg"], c["stride"], c["bmp"]
+        # attnum commence a 1 dans pg_attribute, les chaines sont indexees de 0.
+        col, stride = c["attnum"] - 1, c["stride"]
         for t in range(p["n_tuples"]):
-            if is_null(page, reg, t):
+            if is_null_row(page, p, col, t):
                 continue
-            off, = struct.unpack_from("<H", page, reg["start"] + bmp + t * stride)
+            slot = slot_offset(p, col, stride, t)
+            off, = struct.unpack_from("<H", page, slot)
             if off in seen:
                 continue
             txt, aligned = decode_varlena(page, off)
@@ -212,52 +263,54 @@ def verify_layout(page, p, cols):
     """
     Controle de coherence du layout decode.
 
-    Verifie que les regions sont contigues, que leur somme fait exactement
-    BLCKSZ, et que chaque taille correspond a la formule du code
-    (bitmap de NULL + n_tuples x pas).  Renvoie la liste des anomalies.
+    En version 5 il n'y a plus de regions contigues : la zone basse ne porte
+    que les metadonnees, et le reste de l'arene est un melange de chunks et de
+    charges utiles. On verifie donc ce qui reste verifiable :
+
+      - la zone des metadonnees fait exactement n_tuples x 32 octets ;
+      - chaque chaine de chunks se termine bien sur le maillon designe par la
+        queue, et chaque maillon tient dans l'arene ;
+      - n_rows ne depasse pas PAX_CHUNK_MAX_ROWS ;
+      - la taille d'un chunk est bien celle de la formule du code.
     """
     problems = []
-    segs, cur = [], 0
-
-    def add(label, size):
-        nonlocal cur
-        segs.append((label, cur, cur + size))
-        cur += size
-
-    add("PageHeaderData", SIZEOF_PAGE_HEADER)
-    add("padding", SIZEOF_PAX_SPECIAL)
-    add("PaxPageHeader", p["pax_header_size"])
-    add("meta", p["meta_end"] - p["meta_offset"])
-    for r in p["regions"]:
-        add(f"col{r['attnum']}", r["size"])
-    add("libre", p["pd_upper"] - p["pd_lower"])
-    add("varlena", (BLCKSZ - SIZEOF_PAX_SPECIAL) - p["pd_upper"])
-    add("PaxSpecialData", SIZEOF_PAX_SPECIAL)
-
-    for i in range(len(segs) - 1):
-        if segs[i][2] != segs[i + 1][1]:
-            problems.append((segs[i][0], f"trou avant {segs[i + 1][0]}"))
-    if cur != BLCKSZ:
-        problems.append(("total", f"{cur} != {BLCKSZ}"))
-
     n = p["n_tuples"]
-    exp = n * SIZEOF_TUPLE_META
-    if p["meta_end"] - p["meta_offset"] != exp:
-        problems.append(("meta", f"{p['meta_end'] - p['meta_offset']} != {n}x32={exp}"))
+    top = BLCKSZ - SIZEOF_PAX_SPECIAL
 
-    # v4 : le span peut depasser la taille utile car chaque region s'ouvre
-    # alignee sur 8 octets ; il doit simplement pouvoir la contenir.
-    for i, r in enumerate(p["regions"]):
-        if r is None or i >= len(cols):
-            continue
-        atlen = cols[i]["attlen"]
-        stride = slot_stride(atlen)
-        want = bitmap_size(n) + n * stride
-        if r["size"] < want:
-            problems.append((f"col{i}", f"span {r['size']} < besoin {want}"))
-        # v4 ne pose plus aucune contrainte d'alignement : les lectures
-        # passent par memcpy cote AM. Le span peut donc depasser la taille
-        # utile si une region a ete ouverte avant qu'une autre ne pousse.
+    if p["meta_end"] - p["meta_offset"] != n * SIZEOF_TUPLE_META:
+        problems.append(("meta",
+                         f"{p['meta_end'] - p['meta_offset']} != {n}x32="
+                         f"{n * SIZEOF_TUPLE_META}"))
+    if p["pd_lower"] > top or p["pd_upper"] > top:
+        problems.append(("bornes", "pd_lower ou pd_upper au-dela de la zone speciale"))
+
+    max_chunks = n // PAX_CHUNK_MAX_ROWS + 2
+    for i, cc in enumerate(p["chains"]):
+        chain = cc["chain"]
+        stride = slot_stride(cols[i]["attlen"]) if i < len(cols) else 0
+        size = chunk_size(stride)
+        for ch in chain:
+            ch["size"] = size
+        if len(chain) > max_chunks:
+            problems.append((f"col{i}", f"{len(chain)} chunks > {max_chunks}"))
+        want = -(-n // PAX_CHUNK_MAX_ROWS) if n else 0
+        if len(chain) != want:
+            problems.append((f"col{i}",
+                             f"{len(chain)} chunks pour {n} versions, attendu {want}"))
+        for k, ch in enumerate(chain):
+            if ch["n_rows"] > PAX_CHUNK_MAX_ROWS:
+                problems.append((f"col{i}.{k}",
+                                 f"n_rows {ch['n_rows']} > {PAX_CHUNK_MAX_ROWS}"))
+            if ch["off"] < p["pd_upper"] or ch["off"] + ch["size"] > top:  # noqa: E501
+                problems.append((f"col{i}.{k}",
+                                 f"chunk [{ch['off']}, {ch['off'] + ch['size']}) "
+                                 f"hors arene"))
+        if chain and cc["tail"] not in (0xFFFF, 0) and cc["tail"] != chain[-1]["off"]:
+            problems.append((f"col{i}", "la queue ne designe pas le dernier maillon"))
+
+    if p["chunk_floor"] != top and p["chunk_floor"] < p["pd_upper"]:
+        problems.append(("chunk_floor",
+                         f"{p['chunk_floor']} sous pd_upper {p['pd_upper']}"))
 
     return problems
 
@@ -299,37 +352,34 @@ def main():
     free = p["pd_upper"] - p["pd_lower"]
     varlena_lo, varlena_hi = p["pd_upper"], BLCKSZ - SIZEOF_PAX_SPECIAL
 
-    # --- valeur de depart des slots de chaque colonne -------------------------
+    # --- premiere valeur de chaque version, via le chunk qui la contient ------
     colinfo = []
     for i, c in enumerate(cols):
-        reg = p["regions"][i]
-        if reg is None:
-            colinfo.append(dict(c, reg=None, bmp=0, stride=0, nulls=0, first=[]))
-            continue
+        chain = p["chains"][i]["chain"] if i < len(p["chains"]) else []
         stride = slot_stride(c["attlen"])
-        bmp = reg["size"] - n * stride
-        nulls = null_count(page, p, reg, c["attlen"])
+        nulls = null_count(page, p, i, c["attlen"])
         first = []
         for t in range(shown):
-            # Le bitmap fait foi : un slot NULL ne doit pas être décodé,
-            # son contenu n'est pas une valeur.
-            if is_null(page, reg, t):
+            if is_null_row(page, p, i, t):
                 first.append(None)
                 continue
-            slot = reg["start"] + bmp + t * stride
+            slot = slot_offset(p, i, stride, t)
+            if slot is None:
+                first.append(None)
+                continue
             if c["attlen"] > 0:
                 first.append(decode_fixed(page, slot, c["attlen"]))
             else:
                 off, = struct.unpack_from("<H", page, slot)
                 txt, _ = decode_varlena(page, off)
                 first.append(txt)
-        colinfo.append(dict(c, reg=reg, bmp=bmp, stride=stride, nulls=nulls, first=first))
+        colinfo.append(dict(c, chain=chain, stride=stride, nulls=nulls, first=first))
 
     O = []
     W, H = 1000, 1180
     O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
-    O.append(f'<title>Page PAX v3 réelle — {esc(args.relation)} bloc {args.block}</title>')
+    O.append(f'<title>Page PAX v5 réelle — {esc(args.relation)} bloc {args.block}</title>')
     O.append('<style>'
              '.t{font-size:19px;font-weight:600;fill:#1b2733}'
              '.s{font-size:12px;fill:#5b6b7c}'
@@ -344,7 +394,7 @@ def main():
              '</style>')
 
     O.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
-    O.append(f'<text class="t" x="24" y="36">Page PAX v3 réelle — bloc {args.block} de '
+    O.append(f'<text class="t" x="24" y="36">Page PAX v5 réelle — bloc {args.block} de '
              f'{esc(args.relation)}</text>')
     O.append(f'<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), '
              f'décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont '
@@ -391,8 +441,11 @@ def main():
     txt(IN, y + 33, f"n_tuples <tspan font-weight='600'>{n}</tspan> · "
                     f"meta_offset <tspan font-weight='600'>{p['meta_offset']}</tspan> · "
                     f"free_space {p['free_space']} · flags 0x{p['pax_flags']:04X}", "z m")
-    offs = "  ".join(f"offsets[{i}]={o}" for i, o in enumerate(p["offsets"]))
-    txt(IN, y + 47, offs, "z m")
+    offs = "  ".join(f"chunk_head[{i}]={o}" for i, o in
+                     enumerate(p["chunk_head"][:8]))
+    txt(IN, y + 47,
+        f"chunk_floor {p['chunk_floor']}  " + offs +
+        (f"  …" if len(p["chunk_head"]) > 8 else ""), "z m")
     y += h
 
     # --- metadonnees --------------------------------------------------------
@@ -417,36 +470,37 @@ def main():
         txt(IN + 6, yy + 4, f"… {n - meta_shown} versions supplémentaires", "z")
     y += h
 
-    # --- regions de colonnes ------------------------------------------------
+    # --- chunks, une chaîne par colonne -------------------------------------
     for i, c in enumerate(colinfo):
-        reg = c["reg"]
-        if reg is None:
+        if not c["chain"]:
             continue
-        slots = c["stride"] * n
+        total = sum(ch["size"] for ch in c["chain"])
+        nch = len(c["chain"])
         h = 58 + (2 if shown > 1 else 1) * 15
         box(h, "#cfe3d3" if c["attlen"] > 0 else "#d9d6ea")
-        txt(IN, y + 18, f"Région colonne {i} — {esc(c['name'])} "
-                        f"({esc('int' + str(c['attlen'])) if c['attlen'] > 0 else 'varlena'})", "b")
-        txt(PX + PW - 14, y + 18, f"[{reg['start']}, {reg['end']}) = {reg['size']} o", "zr", "end")
-        txt(IN, y + 33, f"bitmap de NULL : {c['bmp']} o   +   {n} slots × "
-                        f"{c['stride']} o = {slots} o   →   {c['nulls']} NULL", "z m")
+        txt(IN, y + 18, f"Chaîne de chunks — colonne {i} {esc(c['name'])} "
+                        f"({esc('int' + str(c['attlen'])) if c['attlen'] > 0 else 'varlena'})",
+            "b")
+        txt(PX + PW - 14, y + 18,
+            f"{nch} chunk(s) = {total} o", "zr", "end")
+        txt(IN, y + 33,
+            f"bitmap {bitmap_size(PAX_CHUNK_MAX_ROWS)} o + {PAX_CHUNK_MAX_ROWS} slots × "
+            f"{c['stride']} o par chunk  →  {c['nulls']} NULL sur {n} versions", "z m")
         yy = y + 38
-        if c["attlen"] > 0:
-            O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#bcd9c4" '
-                     f'stroke="#7fae8b" stroke-width="1"/>')
-            txt(IN + 6, yy + 11, f"slots de {c['stride']} o (valeur {c['attlen']} o + align)",
-                "z m")
-            yy += 15
-        else:
-            O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#c6c2dd" '
-                     f'stroke="#8d86b5" stroke-width="1"/>')
-            txt(IN + 6, yy + 11, "slots de 2 o = offset ABSOLU de la valeur en haut de page", "z m")
-            yy += 15
-        vals = ", ".join("NULL" if v is None else str(v) for v in c["first"])
+        lbl = (f"slots de {c['stride']} o" if c["attlen"] > 0
+               else "slots de 2 o = offset ABSOLU de la valeur dans l'arène")
+        col = ("#bcd9c4", "#7fae8b") if c["attlen"] > 0 else ("#c6c2dd", "#8d86b5")
+        O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="{col[0]}" '
+                 f'stroke="{col[1]}" stroke-width="1"/>')
+        txt(IN + 6, yy + 11,
+            "offsets : " + ", ".join(str(ch["off"]) for ch in c["chain"][:6]) +
+            (f", … ({nch - 6} de plus)" if nch > 6 else ""), "z m")
+        yy += 15
         O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#ffffff" '
-                 f'stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>')
-        txt(IN + 6, yy + 11, f"premières valeurs : {esc(vals)}" +
-            (f"   … ({n - shown} de plus)" if n > shown else ""), "z m")
+                 f'stroke="{col[1]}" stroke-width="1" stroke-dasharray="3 2"/>')
+        txt(IN + 6, yy + 11,
+            f"premières valeurs : {esc(', '.join('NULL' if v is None else str(v) for v in c['first']))}"
+            + (f"   … ({n - shown} de plus)" if n > shown else ""), "z m")
         y += h
 
     # --- espace libre -------------------------------------------------------
@@ -454,8 +508,8 @@ def main():
     box(h, "#f4f6f8", "5 3")
     txt(IN, y + 20, "Espace libre", "l")
     txt(PX + PW - 14, y + 20, f"[{p['pd_lower']}, {p['pd_upper']}) = {free} o", "zr", "end")
-    txt(IN, y + 37, f"page à {100.0 * (p['pd_lower'] - SIZEOF_PAGE_HEADER) / BLCKSZ:.1f} % "
-                    f"occupée — first-fit n'a plus de place pour une ligne", "z")
+    txt(IN, y + 37, f"zone basse : métadonnées de version, plus aucune région de colonnes — "
+                    f"en v5 les slots vivent dans les chunks de l'arène", "z")
     y += h
 
     # --- varlena ------------------------------------------------------------
@@ -464,8 +518,8 @@ def main():
     box(h, "#e4ddf0")
     txt(IN, y + 18, "Valeurs varlena", "b")
     txt(PX + PW - 14, y + 18, f"[{varlena_lo}, {varlena_hi}) = {varlena_hi - varlena_lo} o", "zr", "end")
-    txt(IN, y + 32, f"pd_upper descend à chaque allocation — {vtotal} valeurs référencées",
-        "z m")
+    txt(IN, y + 32, f"pd_upper descend à chaque allocation, chunks compris — "
+                    f"{vtotal} valeurs référencées, entrelacées avec les chunks", "z m")
     yy = y + 38
     for off, (text, aligned) in vitems:
         O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#d3cbe6" '
@@ -492,7 +546,8 @@ def main():
             print(f"[{label}] {msg}", file=sys.stderr)
         if problems:
             sys.exit("layout incoherent")
-        print("layout vérifié : régions contiguës, total = 8192 o", file=sys.stderr)
+        print("layout vérifié : chaînes de chunks cohérentes, bornes de l'arène "
+              "respectées", file=sys.stderr)
 
     out = "\n".join(O)
     if args.output == "-":
