@@ -2,7 +2,13 @@
 """
 Inspecte une page PAX reelle et emet un schema SVG fidele aux octets lus.
 
-Les structures decodees correspondent exactement a pax_am.c (format v3) :
+Deux sorties possibles :
+
+  defaut   le dump d'une page, zone par zone, avec les valeurs lues ;
+  --schema le schema abstrait du format (zones + ce que fait un INSERT),
+           ancre sur la meme page reelle.
+
+Les structures decodees correspondent exactement a pax_am.c (format v4) :
 
   PageHeaderData (24 o)          storage/bufpage.h
     pd_lsn 8, pd_checksum 2, pd_flags 2, pd_lower 2,
@@ -18,13 +24,14 @@ Les structures decodees correspondent exactement a pax_am.c (format v3) :
     xmin 4, xmax 4, cmin 4, cmax 4, t_ctid 6, flags 2, locker_mxid 4, pad 4
 
   region par colonne : [bitmap de NULL][slots]
-    v4 : slot = attlen si longueur fixe, 2 o si varlena
+    v4 : slot = attlen si longueur fixe, 2 o si varlena, sans MAXALIGN
 
   PaxSpecialData (8 o) en fin de page
     version 2, flags 2, n_attrs 2, magic 2
 
 Usage:
     inspect_pax_page.py <relation> <block> [-o out.svg] [--db base] [--rows N]
+    inspect_pax_page.py <relation> <block> --schema -o schema.svg
 """
 
 import argparse
@@ -208,20 +215,18 @@ def collect_varlena(page, p, colinfo, limit=4):
     return items[:limit], len(seen)
 
 
-def verify_layout(page, p, cols):
+def page_segments(p):
     """
-    Controle de coherence du layout decode.
+    Segmentation exacte de la page, du haut vers le bas.
 
-    Verifie que les regions sont contigues, que leur somme fait exactement
-    BLCKSZ, et que chaque taille correspond a la formule du code
-    (bitmap de NULL + n_tuples x pas).  Renvoie la liste des anomalies.
+    Utilisee par verify_layout() et par le mode --schema, pour que le schema
+    dessine les memes octets que le controle verifie.
     """
-    problems = []
     segs, cur = [], 0
 
-    def add(label, size):
+    def add(label, size, extra=None):
         nonlocal cur
-        segs.append((label, cur, cur + size))
+        segs.append((label, cur, cur + size, extra))
         cur += size
 
     add("PageHeaderData", SIZEOF_PAGE_HEADER)
@@ -233,6 +238,47 @@ def verify_layout(page, p, cols):
     add("libre", p["pd_upper"] - p["pd_lower"])
     add("varlena", (BLCKSZ - SIZEOF_PAX_SPECIAL) - p["pd_upper"])
     add("PaxSpecialData", SIZEOF_PAX_SPECIAL)
+    return segs
+
+
+def insert_delta(p, cols):
+    """
+    Ce que ferait UN INSERT sur cette page, calcule comme pax_tuple_insert().
+
+    Pour chaque colonne la region gagne exactement
+        pax_bitmap_size(tupno+1) - pax_bitmap_size(tupno)  +  pas
+    octets, inseres a offsets[i] : ce qui se trouve au-dela est memmove, et
+    tout offsets[j] >= at est augmente de la meme longueur.  La metadonnee
+    gagne 32 octets, les valeurs hors ligne sont prises au-dessus de pd_upper.
+
+    v4 ne pose aucune contrainte d'alignement (les lectures passent par
+    memcpy), donc les deltas sont calcules au byte pres.
+    """
+    n = p["n_tuples"]
+    bmp_grow = bitmap_size(n + 1) - bitmap_size(n)
+    out = dict(n=n, bmp_grow=bmp_grow, meta= SIZEOF_TUPLE_META, cols=[])
+    for i, c in enumerate(cols):
+        r = p["regions"][i]
+        stride = slot_stride(c["attlen"])
+        out["cols"].append(dict(name=c["name"], attlen=c["attlen"],
+                                start=(r["start"] if r else None),
+                                size=(r["size"] if r else 0),
+                                stride=stride, delta=bmp_grow + stride))
+    out["total"] = (out["meta"] + sum(c["delta"] for c in out["cols"]))
+    return out
+
+
+def verify_layout(page, p, cols):
+    """
+    Controle de coherence du layout decode.
+
+    Verifie que les regions sont contigues, que leur somme fait exactement
+    BLCKSZ, et que chaque taille correspond a la formule du code
+    (bitmap de NULL + n_tuples x pas).  Renvoie la liste des anomalies.
+    """
+    problems = []
+    segs = page_segments(p)
+    cur = segs[-1][2]
 
     for i in range(len(segs) - 1):
         if segs[i][2] != segs[i + 1][1]:
@@ -266,6 +312,292 @@ def esc(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def emit_schema(p, cols, relation, block):
+    """
+    Schema abstrait du format v4 : le squelette de la page et ce qu'un INSERT
+    y deplace.
+
+    Ce que les deux dumps ne peuvent pas montrer. Un dump est un etat fige ; ce
+    qui definit v4, c'est le mouvement. Le schema est donc trace autour de la
+    segmentation reelle (page_segments, la meme que --verify) et de
+    l'arithmetique reelle d'un INSERT (insert_delta, calculee comme
+    pax_tuple_insert), ancrees sur une page reelle dont on donne la provenance.
+    """
+    segs = page_segments(p)
+    d = insert_delta(p, cols)
+
+    # Insertion simulee colonne par colonne, comme pax_tuple_insert() :
+    # pd_lower croit au fur et a mesure, donc le volume memmove n'est pas la
+    # somme de (pd_lower_initial - start) mais l'integrale de l'etat courant.
+    cur = p["pd_lower"]
+    moved = 0
+    for c in d["cols"]:
+        if c["start"] is not None:
+            moved += cur - c["start"]
+        cur += c["delta"]
+    d["moved"] = moved
+    d["pd_lower_after"] = cur
+
+    O = []
+    W, H0 = 1200, 1560
+    PX, PW = 40, 500
+    IN = PX + 12
+    IW = PW - 24
+    tx = 588
+
+    H = H0   # recalcule a la fin sur le contenu reellement trace
+    O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
+    O.append('<title>Schéma du format de page PAX v4 — ce que fait un INSERT</title>')
+    O.append('<style>'
+             '.t{font-size:20px;font-weight:600;fill:#1b2733}'
+             '.s{font-size:12px;fill:#5b6b7c}'
+             '.h{font-size:14px;font-weight:600;fill:#1b2733}'
+             '.b{font-size:11.5px;font-weight:600;fill:#1b2733}'
+             '.l{font-size:11.5px;fill:#1b2733}'
+             '.m{font-family:\'DejaVu Sans Mono\',Menlo,monospace}'
+             '.z{font-size:10px;fill:#45566a}'
+             '.zr{font-size:10px;fill:#45566a;text-anchor:end}'
+             '.f{stroke:#33475b;stroke-width:2}'
+             '</style>')
+    O.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
+
+    maxy = [0]
+
+    def txt(x, y, s, cls="z", anchor=None):
+        a = f' text-anchor="{anchor}"' if anchor else ""
+        maxy[0] = max(maxy[0], y)
+        O.append(f'<text class="{cls}" x="{x}" y="{y}"{a}>{s}</text>')
+
+    y = 40
+    txt(24, y, 'Schéma du format de page PAX v4 — une région par colonne', 't')
+    y += 20
+    txt(24, y, 'Zones tracées à leur taille réelle ; arithmétique de l\'INSERT '
+               'prise dans pax_tuple_insert().', 's')
+    y += 16
+    txt(24, y, f'Ancré sur le bloc {block} de {esc(relation)} : '
+               f'{d["n"]} versions, {len(cols)} colonnes.', 's')
+
+    # ---------------- squelette -------------------------------------------
+    y += 26
+    txt(PX, y, 'la page, du haut vers le bas', 'b')
+    y += 8
+
+    fills = {"PageHeaderData": "#dbe4ee", "padding": "#eef2f6",
+             "PaxPageHeader": "#c9dcea", "meta": "#e4ecdc",
+             "libre": "#fdf6e3", "varlena": "#f3e6de",
+             "PaxSpecialData": "#dbe4ee"}
+
+    def h_for(size):
+        return max(15.0, min(74.0, size / 8192.0 * 470))
+
+    top_of = {}
+    for label, lo, hi, _ in segs:
+        size = hi - lo
+        top_of[label] = y
+        h = h_for(size)
+        fill = "#dfe9f2" if label.startswith("col") else fills.get(label, "#eee")
+        dsh = ' stroke-dasharray="4 2"' if label == "libre" else ""
+        O.append(f'<rect class="f" x="{PX}" y="{y}" width="{PW}" height="{h}" '
+                 f'fill="{fill}"{dsh}/>')
+        key = f"col{label[3:]}" if label.startswith("col") else label
+        if size <= 0:
+            txt(IN, y + 11, f'{key} — vide', 'z')
+        elif h < 26:
+            txt(IN, y + h - 5, f'{key} · {size} o', 'z')
+        else:
+            txt(IN, y + 15, key, 'b')
+            txt(PX + PW - 10, y + 15, f'{size} o', 'zr', 'end')
+            txt(PX + PW - 10, y + 28, f'[{lo}, {hi})', 'zr', 'end')
+        y += h
+
+    y += 16
+    txt(PX, y, 'offset 0 en haut, 8192 en bas.', 'l')
+    y += 15
+    txt(PX, y, 'pd_lower monte quand une région ou la métadonnée grandit ;', 'l')
+    y += 15
+    txt(PX, y, 'pd_upper descend quand une valeur hors ligne est allouée.', 'l')
+    y += 15
+    txt(PX, y, 'L\'espace libre est ce qui reste entre les deux.', 'l')
+    y += 24
+
+    # ---------------- le detail des zones ---------------------------------
+    txt(PX, y, 'Ce que contient chaque zone', 'h')
+    y += 20
+
+    def zone_detail(label, lo, hi, _):
+        nonlocal y
+        size = hi - lo
+        if label.startswith("col"):
+            i = int(label[3:])
+            if i >= len(cols):
+                return
+            c = cols[i]
+            stride = slot_stride(c["attlen"])
+            bmp = size - d["n"] * stride
+            slack = size - (bmp + d["n"] * stride)
+            txt(PX, y, f'· région {i} — {esc(c["name"])}', 'b')
+            txt(PX + PW - 10, y, f'{size} o', 'zr', 'end')
+            y += 15
+            txt(PX + 14, y, f'bitmap {bmp} o  +  {d["n"]} slots × {stride} o  = '
+                            f'{bmp + d["n"] * stride} o', 'm')
+            if slack:
+                txt(PX + 14 + 200, y, f'+{slack} o de bourrage', 'z')
+            y += 20
+        elif label == "meta":
+            txt(PX, y, '· zone de métadonnées', 'b')
+            txt(PX + PW - 10, y, f'{size} o', 'zr', 'end')
+            y += 15
+            txt(PX + 14, y, f'{d["n"]} × {SIZEOF_TUPLE_META} o = '
+                            f'{d["n"] * SIZEOF_TUPLE_META} o', 'm')
+            txt(PX + 14 + 130, y, 'une PaxTupleMetaData par version', 'z')
+            y += 20
+        elif label == "PaxPageHeader":
+            txt(PX, y, '· PaxPageHeader', 'b')
+            txt(PX + PW - 10, y, f'{size} o', 'zr', 'end')
+            y += 15
+            txt(PX + 14, y, f'n_tuples, meta_offset, free_space, flags,', 'm')
+            txt(PX + 14, y + 13, f'puis offsets[{len(cols)}] — un offset par colonne', 'm')
+            y += 33
+        elif label == "varlena":
+            txt(PX, y, '· valeurs hors ligne', 'b')
+            txt(PX + PW - 10, y, f'{size} o', 'zr', 'end')
+            y += 15
+            txt(PX + 14, y, 'le slot ne contient que l\'offset absolu, 2 o', 'm')
+            y += 20
+
+    for seg in segs:
+        zone_detail(*seg)
+
+    y += 14
+    txt(PX, y, 'Ce que fait UN INSERT', 'h')
+    y += 20
+    for c in d["cols"]:
+        txt(PX, y, f'· {esc(c["name"]):<10} +{c["delta"]} o', 'm')
+        txt(PX + 190, y, f'= bitmap {d["bmp_grow"]} o + slot {c["stride"]} o', 'z')
+        y += 17
+    txt(PX, y, f'· {"métadonnées":<10} +{d["meta"]} o', 'm')
+    y += 17
+    txt(PX, y, f'  pd_lower : {p["pd_lower"]} → {d["pd_lower_after"]}', 'm')
+    y += 17
+    txt(PX, y, "  valeurs hors ligne : pd_upper descend d'autant", 'l')
+    y += 26
+
+    txt(PX, y, 'Le coût, mesuré sur cette page', 'h')
+    y += 20
+    txt(PX, y, f'· {d["moved"]} octets memmovés par INSERT — une fois par', 'l')
+    y += 16
+    txt(PX + 14, y, 'colonne, chaque pax_insert_bytes() décalant', 'l')
+    y += 16
+    txt(PX + 14, y, 'tout ce qui suit la région qu\'il agrandit', 'l')
+    y += 16
+    txt(PX, y, f'· {len(d["cols"])} memmove et {len(d["cols"])} passes sur '
+               f'offsets[]', 'l')
+    y += 16
+    txt(PX + 14, y, 'par ligne insérée', 'l')
+    y += 16
+    pct = round(100.0 * d["moved"] / BLCKSZ)
+    txt(PX, y, f'· soit {pct} % d\'une page déplacée pour écrire', 'l')
+    y += 16
+    txt(PX + 14, y, 'une seule ligne', 'l')
+    y += 16
+    txt(PX, y, '· un INSERT coûte donc O(lignes déjà présentes)', 'l')
+    y += 16
+    txt(PX + 14, y, '× colonnes — pas O(1) comme un tuple heap', 'l')
+    y += 26
+
+    txt(PX, y, 'Pourquoi déplacer ne casse rien', 'h')
+    y += 20
+    for line in [
+        'Un t_ctid PAX ne contient pas un offset d\'octet : il contient',
+        '(bloc, index de version). Décaler une région ne déplace donc aucun',
+        'lien entrant — un lien vers la version 7 pointe toujours vers',
+        'l\'index 7, où qu\'elle soit devenue. Le seul ascenseur à corriger',
+        'est offsets[], et la boucle le reconstruit.',
+    ]:
+        txt(PX, y, line, 'l')
+        y += 15
+    y += 4
+    for line in [
+        'C\'est la contrepartie exacte de heap : là, lp_off est un offset',
+        'réel et un tuple ne bouge jamais ; PAX bouge mais n\'a que des',
+        'liens logiques. Laquelle des deux échange vaut mieux est la',
+        'question ouverte de analyse1.md §18.',
+    ]:
+        txt(PX, y, line, 'l')
+        y += 15
+
+    # ---------------- colonne droite ---------------------------------------
+    rx, rw = tx, W - tx - 40
+    ry = 104          # sous le titre, qui occupe toute la largeur
+
+    def panel(title, lines, fill, stroke, mono_from=0):
+        """Boite de titre + lignes, hauteur calculee sur le contenu."""
+        nonlocal ry
+        n = len(lines)
+        h = 26 + n * 15 + 12
+        O.append(f'<rect x="{rx}" y="{ry}" width="{rw}" height="{h}" '
+                 f'fill="{fill}" stroke="{stroke}"/>')
+        txt(rx + 14, ry + 21, title, 'h')
+        yy = ry + 42
+        for i, line in enumerate(lines):
+            txt(rx + 14, yy, line, 'm' if i >= mono_from else 'l')
+            yy += 15
+        ry += h + 26
+
+    panel('Pas de slot, par type', [
+        '1 o    bool, "char"                     ch',
+        '2 o    text, numeric, bytea, varchar   t1 t2 t3 t4',
+        '4 o    int4, real, date                 id k4 f4 d1',
+        '8 o    int8, float8, timestamp          k8 f8 ts1',
+        '16 o   interval, uuid                   iv1 uu',
+        '',
+        'Pas de MAXALIGN depuis la v4 : les lectures passent par memcpy.',
+    ], '#f7f9fb', '#c3cedb')
+
+    panel('Bitmap de NULL', [
+        'Un bit par version, dimensionné par le nombre de',
+        'versions — jamais par le span de la région, qui',
+        'est bourré d\'alignement et donc non canonique.',
+        '',
+        f'sur cette page : {bitmap_size(d["n"])} o pour {d["n"]} versions',
+    ], '#f7f9fb', '#c3cedb', mono_from=4)
+
+    panel('Ce que ce schéma ne montre pas', [
+        'Le balayage. pax_slot_materialize() copie toutes les',
+        'colonnes de chaque ligne, sous le verrou de contenu de',
+        'la page, même pour une projection d\'une seule colonne :',
+        'count(*), 1 colonne et 20 colonnes coûtent la même',
+        'chose. C\'est le poste de CPU n°1 de PAX, mesuré',
+        '~ -60 % récupérable — et il est bloqué sur une adresse',
+        'de ligne stable, que v4 ne fournit pas. Le format à',
+        'chunks de la v5 le faisait, au prix de la densité.',
+    ], '#fdf6e3', '#e0d2a8')
+
+    panel('Vérifier une page', [
+        'inspect_pax_page.py TBL 0 --verify -o page.svg',
+        '',
+        'Régions contiguës, total = 8192 o.',
+        'Les dumps docs/pax-page.svg et docs/pax-page-reelle.svg',
+        'montrent le même format sur des tables concrètes.',
+    ], '#f7f9fb', '#c3cedb', mono_from=0)
+
+    panel('Ce qui n\'existe plus', [
+        'La v5 a remplacé offsets[] par des chaînes de chunks de',
+        'taille fixe, pour que les lignes ne bougent plus. Elle a',
+        'été revertie : elle coûtait de la densité de page et',
+        'imposait de désactiver la compaction des charges utiles.',
+        'Le code est revenu à v4 ; la piste reste dans analyse1.md',
+        'sections 17 et 18.',
+    ], '#eef2f6', '#c3cedb')
+
+    # Le canevas est dimensionne sur le contenu traces, pas sur une constante
+    # devinee : le mode --schema est susceptible d'etre relu sur d'autres
+    # tables, avec d'autres nombres de colonnes.
+    h = int(maxy[0] + 28)
+    O[0] = O[0].replace(f'height="{H0}"', f'height="{h}"')
+    O.append('</svg>')
+    return "\n".join(O), W, h
 def cid(v):
     """CommandId invalide = 0xFFFFFFFF : trop long pour la ligne, on l'abrege."""
     return "—" if v == 0xFFFFFFFF else str(v)
@@ -282,6 +614,9 @@ def main():
     ap.add_argument("--meta-rows", type=int, default=5)
     ap.add_argument("--verify", action="store_true",
                     help="controle la coherence du layout avant de produire le SVG")
+    ap.add_argument("--schema", action="store_true",
+                    help="schema abstrait du format (zones + ce que fait un INSERT) "
+                         "au lieu du dump d'une page")
     args = ap.parse_args()
 
     db = args.db or os.environ.get("PGDATABASE") or "postgres"
@@ -291,6 +626,18 @@ def main():
 
     cols = fetch_columns(args.psql, db, args.relation)
     p = parse_page(page)
+
+    if args.schema:
+        problems = verify_layout(page, p, cols) if args.verify else []
+        if problems:
+            for what, why in problems:
+                print(f"  ATTENTION  {what} : {why}", file=sys.stderr)
+            sys.exit("layout incoherent, schema non produit")
+        svg, W, H = emit_schema(p, cols, args.relation, args.block)
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(svg)
+        print(f"ecrit : {args.output}")
+        return
 
     n = p["n_tuples"]
     shown = min(args.rows, n)
@@ -329,7 +676,7 @@ def main():
     W, H = 1000, 1180
     O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
-    O.append(f'<title>Page PAX v3 réelle — {esc(args.relation)} bloc {args.block}</title>')
+    O.append(f'<title>Page PAX v4 réelle — {esc(args.relation)} bloc {args.block}</title>')
     O.append('<style>'
              '.t{font-size:19px;font-weight:600;fill:#1b2733}'
              '.s{font-size:12px;fill:#5b6b7c}'
@@ -344,7 +691,7 @@ def main():
              '</style>')
 
     O.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
-    O.append(f'<text class="t" x="24" y="36">Page PAX v3 réelle — bloc {args.block} de '
+    O.append(f'<text class="t" x="24" y="36">Page PAX v4 réelle — bloc {args.block} de '
              f'{esc(args.relation)}</text>')
     O.append(f'<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), '
              f'décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont '

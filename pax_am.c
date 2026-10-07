@@ -326,6 +326,22 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 static Size         pax_slot_stride(Form_pg_attribute attr);
 static Size         pax_region_used(int n_tuples, Size stride);
 static Size         pax_bitmap_size(int n_tuples);
+
+/*
+ * Plafond d'une demande au FSM.
+ *
+ * MaxFSMRequestSize n'est pas exporté par freespace.c : c'est MaxHeapTupleSize,
+ * qu'il définit à partir de ce que la FSM sait représenter. On recompose donc
+ * l'expression, et on vérifie qu'elle n'a pas bougé d'une version à l'autre.
+ * Une dérive se traduirait en « invalid FSM request size », donc en plantage
+ * net plutôt qu'en corruption, mais indolore jusqu'au premier INSERT large.
+ */
+#define PaxMaxFSMRequestSize \
+    (BLCKSZ - MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData)))
+
+StaticAssertDecl(MaxHeapTupleSize == PaxMaxFSMRequestSize,
+                 "pax: FSM request ceiling moved; update PaxMaxFSMRequestSize");
+
 static Size         pax_insert_space_hint(Relation rel, Datum *values,
                                           bool *isnulls);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
@@ -2832,55 +2848,8 @@ pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
 }
 
 /*
-<<<<<<< Updated upstream
- * Borne inférieure de l'espace requis pour une insertion, servant à
- * interroger le FSM avant de connaître l'état de la page.
-||||||| Stash base
- * Espace demandé au FSM pour trouver une page d'accueil.
-=======
  * Espace demande au FSM pour trouver une page d'accueil.
->>>>>>> Stashed changes
  *
-<<<<<<< Updated upstream
- * On prend deliberately le delta de bitmap à zéro, c'est-à-dire le coût d'un
- * ajout sur une page déjà bien remplie : la valeur est donc une borne
- * inférieure, jamais une surestimation. Le FSM propose ainsi au moins tous
- * les candidats réellement utilisables, et la place exacte est revérifiée sous
- * verrou exclusif avant d'écrire.
-||||||| Stash base
- * Contrairement à la version 4, c'est une MAJORATION et non une borne
- * inférieure, et c'est délibéré : on compte un chunk par colonne, alors
- * qu'une insertion n'en ouvre un que si elle tombe au-delà des chunks
- * existants de cette colonne.
- *
- * La raison est la terminaison du parcours de sélection. La boucle qui essaie
- * les pages candidates sort par RecordAndGetPageWithFreeSpace(), qui ne rend
- * jamais deux fois la même page. Mais elle ne rend InvalidBlockNumber que
- * lorsqu'aucune page n'a la place demandée. Si cette place était une borne
- * inférieure, une page disposant d'entre hint et needed octets — cas
- * ordinaire dès qu'une colonne doit ouvrir un chunk — serait proposée, rejetée
- * sous le verrou exclusif, rendue, puis re-proposée indéfiniment. C'est
- * exactement le plantage observé : l'UPDATE ne finissait pas.
- *
- * En majorant, le FSM ne propose que des pages qui conviennent même dans le
- * pire cas, donc le parcours se termine toujours. Le prix est un
- * remplissage légèrement moins dense, borné à un chunk par colonne et par
- * ligne insérée, donc à environ 1/PAX_CHUNK_MAX_ROWS de la place par colonne
- * pour les pages déjà bien remplies.
- *
- * Le FSM n'accepte qu'une demande entre 1 et MaxFSMRequestSize, c'est-à-dire
- * MaxHeapTupleSize = 8160 o. fsm_space_needed_to_cat() rejette le reste par
- * « invalid FSM request size ». Cette majoration n'est donc pas bornée : à
- * partir de 20 colonnes melangees, un jeu de chunks plus les valeurs de la
- * ligne dépasse déjà les 8192 o d'une page.
- *
- * Saturer à MaxFSMRequestSize ne coûte rien à la terminaison — c'est encore
- * une majoration, et la plus forte que le FSM accepte — et cela laisse le
- * diagnostic honnête remonter de pax_insert_space_needed(), qui sait dire
- * précisément combien d'octets la ligne demande et combien la page neuve en
- * offre. Saturer plus bas serait une sous-estimation, donc le piège de
- * non-terminaison décrit plus haut.
-=======
  * C'est une MAJORATION, pas une borne inferieure, et c'est delibere.
  *
  * La raison est la terminaison du parcours de selection. La boucle qui essaie
@@ -2911,7 +2880,6 @@ pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
  * diagnostic honnete remonter de pax_insert_space_needed(), qui sait dire
  * combien d'octets la ligne demande et combien la page neuve en offre.
  * Saturer plus bas serait une sous-estimation, donc le piege ci-dessus.
->>>>>>> Stashed changes
  */
 static Size
 pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
@@ -2925,18 +2893,11 @@ pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-<<<<<<< Updated upstream
-        need += pax_slot_stride(attr);
-||||||| Stash base
-        /* Le chunk que cette colonne ouvrirait au pire. */
-        need += pax_chunk_size(pax_slot_stride(attr));
-=======
         /* Un slot de plus dans la region de cette colonne... */
         need += pax_slot_stride(attr);
 
         /* ... et le pire agrandissement de son bitmap. */
         need += sizeof(uint64);
->>>>>>> Stashed changes
 
         if (isnulls[i] || attr->attlen >= 0)
             continue;
@@ -2948,15 +2909,8 @@ pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
         need += amount;
     }
 
-<<<<<<< Updated upstream
-    return need;
-||||||| Stash base
-    /* 1 octet minimum : 0 demanderait la catégorie 1 sans rien garantir. */
-    return Max((Size) 1, Min(need, (Size) PaxMaxFSMRequestSize));
-=======
     /* 1 octet minimum : 0 demanderait la categorie 1 sans rien garantir. */
     return Max((Size) 1, Min(need, (Size) PaxMaxFSMRequestSize));
->>>>>>> Stashed changes
 }
 
 /*
