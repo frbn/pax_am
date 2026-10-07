@@ -1,79 +1,109 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1180" viewBox="0 0 1000 1180" font-family="'DejaVu Sans',Helvetica,Arial,sans-serif">
-<title>Page PAX v3 réelle — ventes bloc 0</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1073" viewBox="0 0 1040 1073" font-family="'DejaVu Sans',Helvetica,Arial,sans-serif">
+<rect width="1040" height="1073" fill="#fff"/>
+<title>Page PAX v5 réelle — ventes bloc 0</title>
 <style>.t{font-size:19px;font-weight:600;fill:#1b2733}.s{font-size:12px;fill:#5b6b7c}.b{font-size:12.5px;font-weight:600;fill:#1b2733}.l{font-size:11.5px;fill:#1b2733}.m{font-family:'DejaVu Sans Mono',Menlo,monospace}.z{font-size:9.5px;fill:#45566a}.zr{font-size:9.5px;fill:#45566a;text-anchor:end}.n{font-size:11px;fill:#45566a}.nb{font-size:12px;fill:#1b2733;font-weight:600}.f{stroke:#33475b;stroke-width:2}</style>
-<rect width="1000" height="1180" fill="#fff"/>
-<text class="t" x="24" y="36">Page PAX v3 réelle — bloc 0 de ventes</text>
+<text class="t" x="24" y="36">Page PAX v5 réelle — bloc 0 de ventes</text>
 <text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont lues, pas estimées.</text>
 <rect class="f" x="120" y="82" width="470" height="62" fill="#dbe4ee"/>
 <text class="b" x="134" y="100">PageHeaderData</text>
 <text class="zr" x="576" y="100" text-anchor="end">24 o — offset 0</text>
-<text class="z m" x="134" y="116">pd_lsn 0x906EA99000000000 · pd_checksum 0 · pd_flags 0</text>
-<text class="z m" x="134" y="130">pd_lower <tspan font-weight='600'>5136</tspan> · pd_upper <tspan font-weight='600'>6424</tspan> · pd_special 8184</text>
+<text class="z m" x="134" y="116">pd_lsn 0xDBDF1FE000000001 · pd_checksum 0 · pd_flags 0</text>
+<text class="z m" x="134" y="130">pd_lower <tspan font-weight='600'>3896</tspan> · pd_upper <tspan font-weight='600'>4952</tspan> · pd_special 8184</text>
 <rect class="f" x="120" y="144" width="470" height="20" fill="#eef2f6" stroke-dasharray="4 2"/>
 <text class="z" x="134" y="158">padding d'alignement — PaxPageHeaderPtr = page + 24 + 8</text>
 <text class="zr" x="576" y="158" text-anchor="end">8 o — offset 24</text>
 <rect class="f" x="120" y="164" width="470" height="58" fill="#c9dcea"/>
 <text class="b" x="134" y="182">PaxPageHeader</text>
-<text class="zr" x="576" y="182" text-anchor="end">16 o — offset 32</text>
-<text class="z m" x="134" y="197">n_tuples <tspan font-weight='600'>120</tspan> · meta_offset <tspan font-weight='600'>48</tspan> · free_space 1288 · flags 0x0018</text>
-<text class="z m" x="134" y="211">offsets[0]=3888  offsets[1]=4384  offsets[2]=4640</text>
+<text class="zr" x="576" y="182" text-anchor="end">24 o — offset 32</text>
+<text class="z m" x="134" y="197">n_tuples <tspan font-weight='600'>120</tspan> · meta_offset <tspan font-weight='600'>56</tspan> · free_space 1056 · flags 0x0018</text>
+<text class="z m" x="134" y="211">chunk_floor 5288  chunk_head[0]=8024  chunk_head[1]=5512  chunk_head[2]=7944  chunk_head[3]=5432  chunk_head[4]=7800  chunk_head[5]=5288</text>
 <rect class="f" x="120" y="222" width="470" height="134" fill="#f6cdd2"/>
 <text class="b" x="134" y="240">Région de métadonnées</text>
 <text class="zr" x="576" y="240" text-anchor="end">120 × 32 = 3840 o</text>
 <text class="z m" x="134" y="254">offsets [0..3839] — une PaxTupleMetaData par version</text>
 <rect x="134" y="262" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
-<text class="z m" x="140" y="273">v0  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z m" x="140" y="273">v0  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
 <rect x="134" y="278" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
-<text class="z m" x="140" y="289">v1  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z m" x="140" y="289">v1  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
 <rect x="134" y="294" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
-<text class="z m" x="140" y="305">v2  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z m" x="140" y="305">v2  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
 <rect x="134" y="310" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
-<text class="z m" x="140" y="321">v3  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z m" x="140" y="321">v3  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
 <rect x="134" y="326" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
-<text class="z m" x="140" y="337">v4  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+<text class="z m" x="140" y="337">v4  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
 <text class="z" x="140" y="346">… 115 versions supplémentaires</text>
 <rect class="f" x="120" y="356" width="470" height="88" fill="#cfe3d3"/>
-<text class="b" x="134" y="374">Région colonne 0 — id (int4)</text>
-<text class="zr" x="576" y="374" text-anchor="end">[3888, 4384) = 496 o</text>
-<text class="z m" x="134" y="389">bitmap de NULL : 16 o   +   120 slots × 4 o = 480 o   →   0 NULL</text>
+<text class="b" x="134" y="374">Chaîne de chunks — colonne 0 id (integer)</text>
+<text class="zr" x="576" y="374" text-anchor="end">4 chunk(s) = 576 o</text>
+<text class="z m" x="134" y="389">8 o d'en-tête + bitmap 8 o + 32 slots × 4 o = 144 o  →  0 NULL sur 120 versions</text>
 <rect x="134" y="394" width="442" height="14" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
-<text class="z m" x="140" y="405">slots de 4 o (valeur 4 o + align)</text>
+<text class="z m" x="140" y="405">offsets : 8024, 7192, 6344, 5512</text>
 <rect x="134" y="409" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
 <text class="z m" x="140" y="420">premières valeurs : 1, 2, 3, 4, 5   … (115 de plus)</text>
 <rect class="f" x="120" y="444" width="470" height="88" fill="#d9d6ea"/>
-<text class="b" x="134" y="462">Région colonne 1 — nom (varlena)</text>
-<text class="zr" x="576" y="462" text-anchor="end">[4384, 4640) = 256 o</text>
-<text class="z m" x="134" y="477">bitmap de NULL : 16 o   +   120 slots × 2 o = 240 o   →   10 NULL</text>
+<text class="b" x="134" y="462">Chaîne de chunks — colonne 1 nom (text)</text>
+<text class="zr" x="576" y="462" text-anchor="end">4 chunk(s) = 320 o</text>
+<text class="z m" x="134" y="477">8 o d'en-tête + bitmap 8 o + 32 slots × 2 o = 80 o  →  10 NULL sur 120 versions</text>
 <rect x="134" y="482" width="442" height="14" fill="#c6c2dd" stroke="#8d86b5" stroke-width="1"/>
-<text class="z m" x="140" y="493">slots de 2 o = offset ABSOLU de la valeur en haut de page</text>
-<rect x="134" y="497" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
+<text class="z m" x="140" y="493">offsets : 7944, 7112, 6264, 5432</text>
+<rect x="134" y="497" width="442" height="14" fill="#ffffff" stroke="#8d86b5" stroke-width="1" stroke-dasharray="3 2"/>
 <text class="z m" x="140" y="508">premières valeurs : client-1, client-2, client-3, client-4, client-5   … (115 de plus)</text>
 <rect class="f" x="120" y="532" width="470" height="88" fill="#cfe3d3"/>
-<text class="b" x="134" y="550">Région colonne 2 — quantite (int4)</text>
-<text class="zr" x="576" y="550" text-anchor="end">[4640, 5136) = 496 o</text>
-<text class="z m" x="134" y="565">bitmap de NULL : 16 o   +   120 slots × 4 o = 480 o   →   17 NULL</text>
+<text class="b" x="134" y="550">Chaîne de chunks — colonne 2 quantite (integer)</text>
+<text class="zr" x="576" y="550" text-anchor="end">4 chunk(s) = 576 o</text>
+<text class="z m" x="134" y="565">8 o d'en-tête + bitmap 8 o + 32 slots × 4 o = 144 o  →  17 NULL sur 120 versions</text>
 <rect x="134" y="570" width="442" height="14" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
-<text class="z m" x="140" y="581">slots de 4 o (valeur 4 o + align)</text>
+<text class="z m" x="140" y="581">offsets : 7800, 6968, 6120, 5288</text>
 <rect x="134" y="585" width="442" height="14" fill="#ffffff" stroke="#7fae8b" stroke-width="1" stroke-dasharray="3 2"/>
 <text class="z m" x="140" y="596">premières valeurs : 3, 6, 9, 12, 15   … (115 de plus)</text>
 <rect class="f" x="120" y="620" width="470" height="52" fill="#f4f6f8" stroke-dasharray="5 3"/>
 <text class="l" x="134" y="640">Espace libre</text>
-<text class="zr" x="576" y="640" text-anchor="end">[5136, 6424) = 1288 o</text>
-<text class="z" x="134" y="657">page à 62.4 % occupée — first-fit n'a plus de place pour une ligne</text>
-<rect class="f" x="120" y="672" width="470" height="104" fill="#e4ddf0"/>
-<text class="b" x="134" y="690">Valeurs varlena</text>
-<text class="zr" x="576" y="690" text-anchor="end">[6424, 8184) = 1760 o</text>
-<text class="z m" x="134" y="704">pd_upper descend à chaque allocation — 110 valeurs référencées</text>
-<rect x="134" y="710" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
-<text class="z m" x="140" y="721">@8168  « client-1 »  varlena 16 o</text>
-<rect x="134" y="726" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
-<text class="z m" x="140" y="737">@8152  « client-2 »  varlena 16 o</text>
-<rect x="134" y="742" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
-<text class="z m" x="140" y="753">@8136  « client-3 »  varlena 16 o</text>
-<rect x="134" y="758" width="442" height="14" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
-<text class="z m" x="140" y="769">@8120  « client-4 »  varlena 16 o</text>
-<rect class="f" x="120" y="776" width="470" height="48" fill="#f0dcef"/>
-<text class="b" x="134" y="795">PaxSpecialData</text>
-<text class="zr" x="576" y="795" text-anchor="end">8 o — offset 8184</text>
-<text class="z m" x="134" y="811">version 4 · magic 0x5041 · n_attrs 3 · flags 0x0018</text>
+<text class="zr" x="576" y="640" text-anchor="end">[3896, 4952) = 1056 o</text>
+<text class="z" x="134" y="657">zone basse : métadonnées de version, plus aucune région de colonnes — en v5 les slots vivent dans les chunks de l'arène</text>
+<rect class="f" x="120" y="672" width="470" height="329" fill="#e4ddf0"/>
+<text class="b" x="134" y="690">Arène — chunks et charges utiles entrelacés</text>
+<text class="zr" x="576" y="690" text-anchor="end">[4952, 8184) = 3232 o</text>
+<text class="z m" x="134" y="704">pd_upper descend : 12 chunks + 110 charges utiles référencées, adresses croissantes</text>
+<rect x="134" y="712" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="722">@8168  charge utile — client-1 16 o</text>
+<rect x="134" y="727" width="442" height="13" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
+<text class="z m" x="140" y="737">@8024  chunk c0.0 — id 144 o, 32 versions</text>
+<rect x="134" y="742" width="442" height="13" fill="#c6c2dd" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="752">@7944  chunk c1.0 — nom 80 o, 32 versions</text>
+<rect x="134" y="757" width="442" height="13" fill="#bcd9c4" stroke="#7fae8b" stroke-width="1"/>
+<text class="z m" x="140" y="767">@7800  chunk c2.0 — quantite 144 o, 32 versions</text>
+<rect x="134" y="772" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="782">@7784  charge utile — client-2 16 o</text>
+<rect x="134" y="787" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="797">@7768  charge utile — client-3 16 o</text>
+<rect x="134" y="802" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="812">@7752  charge utile — client-4 16 o</text>
+<rect x="134" y="817" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="827">@7736  charge utile — client-5 16 o</text>
+<rect x="134" y="832" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="842">@7720  charge utile — client-6 16 o</text>
+<rect x="134" y="847" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="857">@7704  charge utile — client-7 16 o</text>
+<rect x="134" y="862" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="872">@7688  charge utile — client-8 16 o</text>
+<rect x="134" y="877" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="887">@7672  charge utile — client-9 16 o</text>
+<rect x="134" y="892" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="902">@7656  charge utile — client-10 16 o</text>
+<rect x="134" y="907" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="917">@7640  charge utile — client-12 16 o</text>
+<rect x="134" y="922" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="932">@7624  charge utile — client-13 16 o</text>
+<rect x="134" y="937" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="947">@7608  charge utile — client-14 16 o</text>
+<rect x="134" y="952" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="962">@7592  charge utile — client-15 16 o</text>
+<rect x="134" y="967" width="442" height="13" fill="#d3cbe6" stroke="#8d86b5" stroke-width="1"/>
+<text class="z m" x="140" y="977">@7576  charge utile — client-16 16 o</text>
+<text class="z" x="140" y="988">… 104 blocs suivants, non montrés</text>
+<text class="z" x="140" y="998">zone libre basse : [3896, 4952) = 1056 o</text>
+<rect class="f" x="120" y="1001" width="470" height="48" fill="#f0dcef"/>
+<text class="b" x="134" y="1020">PaxSpecialData</text>
+<text class="zr" x="576" y="1020" text-anchor="end">8 o — offset 8184</text>
+<text class="z m" x="134" y="1036">version 5 · magic 0x5041 · n_attrs 3 · flags 0x0018</text>
 </svg>

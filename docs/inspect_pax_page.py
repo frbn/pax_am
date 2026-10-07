@@ -42,12 +42,13 @@ import sys
 
 BLCKSZ = 8192
 SIZEOF_PAGE_HEADER = 24
+SizeOfChunkHdr = 8          # MAXALIGN(sizeof(PaxChunkHdr))
 SIZEOF_PAX_SPECIAL = 8
 SIZEOF_TUPLE_META = 32
 PAX_HEADER_FIXED = 10
 
 # Doit etre maintenu en accord avec PAX_CHUNK_MAX_ROWS de pax_am.c.
-PAX_CHUNK_MAX_ROWS = 64
+PAX_CHUNK_MAX_ROWS = 32
 
 
 def maxalign(n):
@@ -78,16 +79,22 @@ def fetch_page(psql, db, relation, blk):
 
 def fetch_columns(psql, db, relation):
     rows = run_sql(psql, db,
-                   f"SELECT attnum, attname, attlen FROM pg_attribute "
+                   f"SELECT attnum, attname, attlen, format_type(atttypid, atttypmod) "
+                   f"FROM pg_attribute "
                    f"WHERE attrelid = '{relation}'::regclass AND attnum > 0 "
                    f"AND NOT attisdropped ORDER BY attnum").splitlines()
-    # attnum est 1-based dans le catalogue : on le rebascule en index de colonne,
-    # ce qui est la base des chaines de chunks et des slots.
-    return [dict(attnum=int(a) - 1, name=b, attlen=int(c)) for a, b, c in
-            (r.split("|") for r in rows)]
+    # attnum est 1-based dans le catalogue, et les chaines de chunks comme les
+    # slots sont indexes par la position de la colonne : on rebascule donc une
+    # fois pour toutes, ici.
+    return [dict(attnum=int(a) - 1, name=b, attlen=int(c), typ=d)
+            for a, b, c, d in (r.split("|") for r in rows)]
 
 
-def parse_page(page):
+def parse_page(page, strides=None):
+    """
+    strides : pas de slot par colonne (attlen si > 0, sinon 2). Sans lui, la
+    taille d'un chunk reste inconnue, car elle ne depend que du pas.
+    """
     p = {}
     (p["pd_lsn"], p["pd_checksum"], p["pd_flags"], p["pd_lower"], p["pd_upper"],
      p["pd_special"], p["pd_pagesize_version"], p["pd_prune_xid"]) = \
@@ -133,7 +140,9 @@ def parse_page(page):
                 break                      # cycle : on s'arrete
             seen.add(off)
             nxt, nrows = struct.unpack_from("<HH", page, off)
-            chain.append(dict(off=off, next=nxt, n_rows=nrows, size=0))
+            stride = strides[i] if strides and i < len(strides) else 0
+            chain.append(dict(off=off, next=nxt, n_rows=nrows,
+                              size=chunk_size(stride)))
             off = nxt
         p["chains"].append(dict(chain=chain, tail=tail))
 
@@ -185,13 +194,24 @@ def null_count(page, p, col, attlen):
 
 
 def decode_fixed(page, off, attlen):
+    """Valeur de longueur fixe, lue par little-endian comme le fait l'AM.
+
+    attlen 1 est un bool (bool CharGetDatum -> 't' / 'f'), pas un entier
+    affiche : le montrer en tant que tel evite de croire a un int errone.
+    """
+    if attlen == 1:
+        return "true" if page[off] else "false"
     if attlen == 2:
         return struct.unpack_from("<h", page, off)[0]
     if attlen == 4:
         return struct.unpack_from("<i", page, off)[0]
     if attlen == 8:
         return struct.unpack_from("<q", page, off)[0]
-    return None
+    if attlen == 6:                     # tid : (BlockNumber, OffsetNumber)
+        blk, = struct.unpack_from("<I", page, off)
+        o2, = struct.unpack_from("<H", page, off + 4)
+        return f"({blk},{o2})"
+    return f"<{attlen} octets>"
 
 
 
@@ -225,10 +245,15 @@ def decode_varlena(page, off):
 
     if size <= 0 or start > len(page) or off + size > len(page):
         return None, 0
+    raw = page[start:off + size]
+    # Un varlena n'est pas forcément du texte : numeric, bytea, uuid... Le
+    # dire est plus utile qu'un point d'interrogation.
     try:
-        text = page[start:off + size].decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return None, maxalign(size)
+        return f"<binaire {len(raw)} o>", maxalign(size)
+    if not text.isprintable():
+        return f"<binaire {len(raw)} o>", maxalign(size)
     return sanitize(text), maxalign(size)
 
 
@@ -238,25 +263,34 @@ def sanitize(s):
 
 
 def collect_varlena(page, p, colinfo, limit=4):
-    """Récupère les valeurs varlena réellement référencées par les slots."""
+    """
+    Valeurs varlena reellement referencees par les slots, {offset: (texte, taille)}.
+
+    On passe par le CONTENU du slot, pas par une plage d'offsets : la zone des
+    charges utiles et celle des chunks se melangent dans l'arene, donc deviner
+    quelles valeurs existent en balayant [pd_upper, top) ramasserait aussi des
+    octets de chunk.
+    """
     seen = {}
     for c in colinfo:
         if c["attlen"] > 0 or not c["chain"]:
             continue
-        # attnum commence a 1 dans pg_attribute, les chaines sont indexees de 0.
-        col, stride = c["attnum"] - 1, c["stride"]
+        # fetch_columns() a deja rebascule attnum en index de colonne 0-based.
+        col, stride = c["attnum"], c["stride"]
         for t in range(p["n_tuples"]):
             if is_null_row(page, p, col, t):
                 continue
             slot = slot_offset(p, col, stride, t)
+            if slot is None:
+                continue
             off, = struct.unpack_from("<H", page, slot)
-            if off in seen:
+            if not off or off in seen:
                 continue
             txt, aligned = decode_varlena(page, off)
             seen[off] = (txt, aligned)
     # pax_alloc_payload empile vers pd_upper : l'offset le plus eleve est le plus ancien
     items = sorted(seen.items(), key=lambda kv: -kv[0])
-    return items[:limit], len(seen)
+    return (items if limit is None else items[:limit]), len(seen)
 
 
 def verify_layout(page, p, cols):
@@ -287,10 +321,7 @@ def verify_layout(page, p, cols):
     max_chunks = n // PAX_CHUNK_MAX_ROWS + 2
     for i, cc in enumerate(p["chains"]):
         chain = cc["chain"]
-        stride = slot_stride(cols[i]["attlen"]) if i < len(cols) else 0
-        size = chunk_size(stride)
-        for ch in chain:
-            ch["size"] = size
+        size = chain[0]["size"] if chain else 0
         if len(chain) > max_chunks:
             problems.append((f"col{i}", f"{len(chain)} chunks > {max_chunks}"))
         want = -(-n // PAX_CHUNK_MAX_ROWS) if n else 0
@@ -313,6 +344,36 @@ def verify_layout(page, p, cols):
                          f"{p['chunk_floor']} sous pd_upper {p['pd_upper']}"))
 
     return problems
+
+
+def collect_arena(page, p, colinfo):
+    """
+    Blocs de l'arène, à leur VRAI offset, chunks et charges utiles confondus.
+
+    C'est indispensable en v5 : les deux familles partagent la descente de
+    pd_upper et s'entrelacent. Les dessiner comme deux zones contigues
+    mentirait sur le format.
+    """
+    blocks = []
+    for i, c in enumerate(colinfo):
+        for k, ch in enumerate(c["chain"]):
+            blocks.append(dict(kind="chunk", col=i, name=c["name"], seq=k,
+                               off=ch["off"], size=ch["size"], n_rows=ch["n_rows"],
+                               typ=c["attlen"]))
+    for off, (text, aligned) in varlena_map(page, p, colinfo).items():
+        blocks.append(dict(kind="payload", col=None, name=text, seq=0,
+                           off=off, size=aligned, n_rows=None, typ=-1))
+    # Adresses croissantes : c'est l'ordre de lecture de l'arene, et pd_upper
+    # descend donc on lit du haut vers le bas.
+    blocks.sort(key=lambda b: -b["off"])
+    return blocks
+
+
+def varlena_map(page, p, colinfo):
+    """Toutes les valeurs varlena referenciaes. Deux valeurs peuvent partage un
+    offset si deux versions portent le meme texte : d'ou un dict."""
+    items, _ = collect_varlena(page, p, colinfo, limit=None)
+    return dict(items)
 
 
 def esc(s):
@@ -343,7 +404,8 @@ def main():
         sys.exit(f"page inattendue : {len(page)} octets")
 
     cols = fetch_columns(args.psql, db, args.relation)
-    p = parse_page(page)
+    strides = [slot_stride(c["attlen"]) for c in cols]
+    p = parse_page(page, strides)
 
     n = p["n_tuples"]
     shown = min(args.rows, n)
@@ -356,7 +418,7 @@ def main():
     colinfo = []
     for i, c in enumerate(cols):
         chain = p["chains"][i]["chain"] if i < len(p["chains"]) else []
-        stride = slot_stride(c["attlen"])
+        stride = strides[i]
         nulls = null_count(page, p, i, c["attlen"])
         first = []
         for t in range(shown):
@@ -368,19 +430,35 @@ def main():
                 first.append(None)
                 continue
             if c["attlen"] > 0:
-                first.append(decode_fixed(page, slot, c["attlen"]))
+                v = decode_fixed(page, slot, c["attlen"])
+                # float4 / float8 sont lisibles en flottant. Sans cela on
+                # afficherait la reinterpretation de l'IEEE 754 en entier : le
+                # nombre affiche est exact mais totalement trompeur.
+                #
+                # "double precision" ne contient PAS le mot "float", il faut
+                # donc tester le type, pas supposer un nom.
+                if c["attlen"] == 8 and c["typ"] in ("double precision", "float8"):
+                    v = struct.unpack_from("<d", page, slot)[0]
+                elif c["attlen"] == 4 and c["typ"] in ("real", "float4"):
+                    v = struct.unpack_from("<f", page, slot)[0]
+                first.append(v)
             else:
                 off, = struct.unpack_from("<H", page, slot)
                 txt, _ = decode_varlena(page, off)
                 first.append(txt)
-        colinfo.append(dict(c, chain=chain, stride=stride, nulls=nulls, first=first))
+        total = sum(ch["size"] for ch in chain)
+        colinfo.append(dict(c, chain=chain, stride=stride, nulls=nulls,
+                            first=first, total=total))
 
+    # Le dessin est produit dans B[], puis la racine SVG est creee a la fin :
+    # la hauteur depend du nombre de blocs d'arene, donc elle ne peut pas etre
+    # fixee a l'avance sans risquer de tronquer le schema.
+    B = []
     O = []
-    W, H = 1000, 1180
-    O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
-             f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
-    O.append(f'<title>Page PAX v5 réelle — {esc(args.relation)} bloc {args.block}</title>')
-    O.append('<style>'
+    W = 1040
+    PX0 = 120
+    B.append(f'<title>Page PAX v5 réelle — {esc(args.relation)} bloc {args.block}</title>')
+    B.append('<style>'
              '.t{font-size:19px;font-weight:600;fill:#1b2733}'
              '.s{font-size:12px;fill:#5b6b7c}'
              '.b{font-size:12.5px;font-weight:600;fill:#1b2733}'
@@ -393,10 +471,9 @@ def main():
              '.f{stroke:#33475b;stroke-width:2}'
              '</style>')
 
-    O.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
-    O.append(f'<text class="t" x="24" y="36">Page PAX v5 réelle — bloc {args.block} de '
+    B.append(f'<text class="t" x="24" y="36">Page PAX v5 réelle — bloc {args.block} de '
              f'{esc(args.relation)}</text>')
-    O.append(f'<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), '
+    B.append(f'<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), '
              f'décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont '
              f'lues, pas estimées.</text>')
 
@@ -408,11 +485,11 @@ def main():
     def box(h, fill, dash=None):
         nonlocal y
         d = f' stroke-dasharray="{dash}"' if dash else ""
-        O.append(f'<rect class="f" x="{PX}" y="{y}" width="{PW}" height="{h}" fill="{fill}"{d}/>')
+        B.append(f'<rect class="f" x="{PX}" y="{y}" width="{PW}" height="{h}" fill="{fill}"{d}/>')
 
     def txt(x, yy, s, cls="z", anchor=None):
         a = f' text-anchor="{anchor}"' if anchor else ""
-        O.append(f'<text class="{cls}" x="{x}" y="{yy}"{a}>{s}</text>')
+        B.append(f'<text class="{cls}" x="{x}" y="{yy}"{a}>{s}</text>')
 
     # --- PageHeaderData -----------------------------------------------------
     h = 62
@@ -458,7 +535,7 @@ def main():
     yy = y + 40
     for t in range(meta_shown):
         m = p["meta"][t]
-        O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#f0b6bd" '
+        B.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#f0b6bd" '
                  f'stroke="#cf8891" stroke-width="1"/>')
         leaf = (m["blk"] == args.block and m["off"] == t + 1)
         nxt = "→ soi-même" if leaf else f"→ ({m['blk']},{m['off']})"
@@ -474,29 +551,29 @@ def main():
     for i, c in enumerate(colinfo):
         if not c["chain"]:
             continue
-        total = sum(ch["size"] for ch in c["chain"])
-        nch = len(c["chain"])
+        total, nch = c["total"], len(c["chain"])
         h = 58 + (2 if shown > 1 else 1) * 15
         box(h, "#cfe3d3" if c["attlen"] > 0 else "#d9d6ea")
         txt(IN, y + 18, f"Chaîne de chunks — colonne {i} {esc(c['name'])} "
-                        f"({esc('int' + str(c['attlen'])) if c['attlen'] > 0 else 'varlena'})",
+                        f"({esc(c['typ'])})",
             "b")
         txt(PX + PW - 14, y + 18,
             f"{nch} chunk(s) = {total} o", "zr", "end")
         txt(IN, y + 33,
-            f"bitmap {bitmap_size(PAX_CHUNK_MAX_ROWS)} o + {PAX_CHUNK_MAX_ROWS} slots × "
-            f"{c['stride']} o par chunk  →  {c['nulls']} NULL sur {n} versions", "z m")
+            f"{SizeOfChunkHdr} o d'en-tête + bitmap {bitmap_size(PAX_CHUNK_MAX_ROWS)} o + "
+            f"{PAX_CHUNK_MAX_ROWS} slots × {c['stride']} o = {chunk_size(c['stride'])} o"
+            f"  →  {c['nulls']} NULL sur {n} versions", "z m")
         yy = y + 38
         lbl = (f"slots de {c['stride']} o" if c["attlen"] > 0
                else "slots de 2 o = offset ABSOLU de la valeur dans l'arène")
         col = ("#bcd9c4", "#7fae8b") if c["attlen"] > 0 else ("#c6c2dd", "#8d86b5")
-        O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="{col[0]}" '
+        B.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="{col[0]}" '
                  f'stroke="{col[1]}" stroke-width="1"/>')
         txt(IN + 6, yy + 11,
             "offsets : " + ", ".join(str(ch["off"]) for ch in c["chain"][:6]) +
             (f", … ({nch - 6} de plus)" if nch > 6 else ""), "z m")
         yy += 15
-        O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#ffffff" '
+        B.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#ffffff" '
                  f'stroke="{col[1]}" stroke-width="1" stroke-dasharray="3 2"/>')
         txt(IN + 6, yy + 11,
             f"premières valeurs : {esc(', '.join('NULL' if v is None else str(v) for v in c['first']))}"
@@ -512,21 +589,43 @@ def main():
                     f"en v5 les slots vivent dans les chunks de l'arène", "z")
     y += h
 
-    # --- varlena ------------------------------------------------------------
-    vitems, vtotal = collect_varlena(page, p, colinfo)
-    h = 40 + max(1, len(vitems)) * 16
+    # --- carte physique de l'arene -------------------------------------------
+    # En v5 chunks et charges utiles partagent UNE descente et s'entrelacent.
+    # Les montrer en deux zones contigues dirait faux sur le format, donc on
+    # les dessine a leur vrai offset, dans l'ordre des adresses croissantes.
+    blocks = collect_arena(page, p, colinfo)
+    MAPW = 300
+    MAXROWS = 18
+    shown_blocks = blocks[:MAXROWS]
+    h = 34 + (len(shown_blocks) + 1) * 15 + (10 if len(blocks) > MAXROWS else 0)
     box(h, "#e4ddf0")
-    txt(IN, y + 18, "Valeurs varlena", "b")
-    txt(PX + PW - 14, y + 18, f"[{varlena_lo}, {varlena_hi}) = {varlena_hi - varlena_lo} o", "zr", "end")
-    txt(IN, y + 32, f"pd_upper descend à chaque allocation, chunks compris — "
-                    f"{vtotal} valeurs référencées, entrelacées avec les chunks", "z m")
-    yy = y + 38
-    for off, (text, aligned) in vitems:
-        O.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="14" fill="#d3cbe6" '
-                 f'stroke="#8d86b5" stroke-width="1"/>')
-        label = f"@{off}  « {esc(text) if text is not None else '?'} »  varlena {aligned} o"
-        txt(IN + 6, yy + 11, label, "z m")
-        yy += 16
+    txt(IN, y + 18, "Arène — chunks et charges utiles entrelacés", "b")
+    txt(PX + PW - 14, y + 18,
+        f"[{p['pd_upper']}, {varlena_hi}) = {varlena_hi - p['pd_upper']} o", "zr", "end")
+    txt(IN, y + 32,
+        f"pd_upper descend : {len([b for b in blocks if b['kind'] == 'chunk'])} chunks + "
+        f"{len([b for b in blocks if b['kind'] == 'payload'])} charges utiles référencées, "
+        f"adresses croissantes", "z m")
+    yy = y + 40
+    for b in shown_blocks:
+        if b["kind"] == "chunk":
+            fill, stroke = "#bcd9c4", "#7fae8b" if b["typ"] > 0 else "#c6c2dd"
+            if b["typ"] <= 0:
+                fill, stroke = "#c6c2dd", "#8d86b5"
+            lbl = (f"@{b['off']:<5} chunk c{b['col']}.{b['seq']} — {esc(b['name'])} "
+                   f"{b['size']} o, {b['n_rows']} versions")
+        else:
+            fill, stroke = "#d3cbe6", "#8d86b5"
+            lbl = (f"@{b['off']:<5} charge utile — {esc(str(b['name']))} "
+                   f"{b['size']} o")
+        B.append(f'<rect x="{IN}" y="{yy}" width="{IW}" height="13" fill="{fill}" '
+                 f'stroke="{stroke}" stroke-width="1"/>')
+        txt(IN + 6, yy + 10, lbl, "z m")
+        yy += 15
+    if len(blocks) > MAXROWS:
+        txt(IN + 6, yy + 6, f"… {len(blocks) - MAXROWS} blocs suivants, non montrés", "z")
+    txt(IN + 6, yy + 6 + (10 if len(blocks) > MAXROWS else 0),
+        f"zone libre basse : [{p['pd_lower']}, {p['pd_upper']}) = {free} o", "z")
     y += h
 
     # --- special ------------------------------------------------------------
@@ -538,6 +637,15 @@ def main():
                     f"n_attrs {p['n_attrs']} · flags 0x{p['special_flags']:04X}", "z m")
     y += h
 
+    # La racine doit etre le PREMIER element du document : le fond blanc passe
+    # donc en premiere position de B, une fois H connue. L'ajouter a la fin
+    # produirait deux elements racine, donc un fichier XML invalide.
+    H = y + 24
+    B.insert(0, f'<rect width="{W}" height="{H}" fill="#fff"/>')
+    O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" '
+             f'font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
+    O.extend(B)
     O.append('</svg>')
 
     if args.verify:

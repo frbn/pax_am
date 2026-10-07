@@ -246,23 +246,35 @@ typedef struct PaxChunkHdr
 
 #define SizeOfPaxChunkHdr   MAXALIGN(sizeof(PaxChunkHdr))
 /*
- * 64, et c'est mesuré : sur une table de 2 000 lignes, le rapport pax/heap
- * du nombre de pages, selon le nombre de colonnes, donne
+ * 32, et la borne n'est pas un goût mais une contrainte de page.
  *
- *     rows/chunk    1 col   8 cols  12 cols
- *          8      0.625     1.313    1.750
- *         16      0.625     1.125    1.563
- *         32      0.625     1.188    1.438
- *         64      0.625     1.125    1.000
+ * Un jeu de chunks est alloué d'un bloc pour TOUTES les colonnes dès la
+ * premiere ligne qui l'ouvre, donc la place qu'il occupe est
  *
- * 64 est le seul qui reste sous 1.0 jusqu'à 11 colonnes, et 1.0 pile à 12.
- * Un chunk plus petit coûte trop d'en-têtes et de bitmaps : c'est le même
- * effet que l'analyse de §16, où un découpage trop fin se paie très cher.
+ *     n_attrs x (16 + PAX_CHUNK_MAX_ROWS x pas)  +  PAX_CHUNK_MAX_ROWS x 32
  *
- * Le compromis reste réel : au-delà de 12 colonnes, PAX reste un peu devant
- * heap, à cause des 32 octets de métadonnées par version, inchangés en v5.
+ * et il doit tenir dans les 8192 octets d'une page, sinon une table assez
+ * large ne peut meme pas recevoir sa premiere ligne. Sur 20 colonnes
+ * (somme des pas = 94), 32 donne 4352 o et 64 donne 8384 o : 64 DEPASSE la
+ * page. La table ne se remplit alors plus que de 13 lignes, chaque chunk
+ * restant a moitie vide.
+ *
+ * Mesure sur 2 000 lignes, rapport pax/heap du nombre de pages :
+ *
+ *     rows/chunk   12 col int   12 col texte   20 col melange
+ *          16        0.781         1.719          0.984
+ *          32        0.813         1.719          0.984
+ *          48        0.781         1.750          1.188
+ *          64        1.000         1.844          2.328
+ *
+ * 32 est le meilleur ou egal partout, et le seul qui tienne a 20 colonnes.
+ *
+ * Contrepartie mesuree : au-dela de 8 colonnes de texte, PAX reste devant
+ * heap (1.72 a 12 colonnes), a cause des 32 octets de metadonnees par version
+ * et des en-tetes de chunks, inchanges en v5. La comparaison reste au profit
+ * de PAX en valeur absolue sur les tables a pas large.
  */
-#define PAX_CHUNK_MAX_ROWS  64
+#define PAX_CHUNK_MAX_ROWS  32
 
 StaticAssertDecl(SizeOfPaxChunkHdr == 8,
                  "pax: chunk header must occupy exactly 8 bytes");
@@ -431,6 +443,22 @@ static Datum        pax_get_value(PaxPageDesc *desc, int attno, int tupno, bool 
 /* Size / page layout */
 static Size         pax_slot_stride(Form_pg_attribute attr);
 static Size         pax_bitmap_size(int n_tuples);
+
+/*
+ * Plafond d'une demande au FSM.
+ *
+ * MaxFSMRequestSize n'est pas exporté par freespace.c : c'est MaxHeapTupleSize,
+ * qu'il définit à partir de ce que la FSM sait représenter. On recompose donc
+ * l'expression, et on vérifie qu'elle n'a pas bougé d'une version à l'autre.
+ * Une dérive se traduirait en « invalid FSM request size », donc en plantage
+ * net plutôt qu'en corruption, mais indolore jusqu'au premier INSERT large.
+ */
+#define PaxMaxFSMRequestSize \
+    (BLCKSZ - MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData)))
+
+StaticAssertDecl(MaxHeapTupleSize == PaxMaxFSMRequestSize,
+                 "pax: FSM request ceiling moved; update PaxMaxFSMRequestSize");
+
 static Size         pax_insert_space_hint(Relation rel, Datum *values,
                                           bool *isnulls);
 static Size         pax_insert_space_needed(Relation rel, Datum *values,
@@ -2915,6 +2943,19 @@ pax_payload_space_needed(Relation rel, Datum *values, bool *isnulls)
  * remplissage légèrement moins dense, borné à un chunk par colonne et par
  * ligne insérée, donc à environ 1/PAX_CHUNK_MAX_ROWS de la place par colonne
  * pour les pages déjà bien remplies.
+ *
+ * Le FSM n'accepte qu'une demande entre 1 et MaxFSMRequestSize, c'est-à-dire
+ * MaxHeapTupleSize = 8160 o. fsm_space_needed_to_cat() rejette le reste par
+ * « invalid FSM request size ». Cette majoration n'est donc pas bornée : à
+ * partir de 20 colonnes melangees, un jeu de chunks plus les valeurs de la
+ * ligne dépasse déjà les 8192 o d'une page.
+ *
+ * Saturer à MaxFSMRequestSize ne coûte rien à la terminaison — c'est encore
+ * une majoration, et la plus forte que le FSM accepte — et cela laisse le
+ * diagnostic honnête remonter de pax_insert_space_needed(), qui sait dire
+ * précisément combien d'octets la ligne demande et combien la page neuve en
+ * offre. Saturer plus bas serait une sous-estimation, donc le piège de
+ * non-terminaison décrit plus haut.
  */
 static Size
 pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
@@ -2941,7 +2982,8 @@ pax_insert_space_hint(Relation rel, Datum *values, bool *isnulls)
         need += amount;
     }
 
-    return need;
+    /* 1 octet minimum : 0 demanderait la catégorie 1 sans rien garantir. */
+    return Max((Size) 1, Min(need, (Size) PaxMaxFSMRequestSize));
 }
 
 /*
