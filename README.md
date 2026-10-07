@@ -42,6 +42,47 @@ make installcheck PG_CONFIG=/path/to/cassert/bin/pg_config \
                  PGHOST=/socket/dir PGPORT=NNNN PGUSER=you
 ```
 
+<<<<<<< Updated upstream
+||||||| Stash base
+### Test tables
+
+Every table in `sql/pax_am.sql` and `specs/pax_mvcc.spec` has the same shape:
+20 columns — primary key, several integer widths, floats, text — with one column
+per slot stride the format distinguishes (1, 2, 4, 8, 16). Each is created
+`WITH (fillfactor = 80, toast_tuple_target = 512)`.
+
+Two things about that clause are worth knowing before adding a table:
+
+- It is **not inherited**. Neither `LIKE` nor `CREATE TABLE AS` copies
+  reloptions, not even `LIKE ... INCLUDING ALL`. A regression sweep near the end
+  of the suite fails if any PAX table is missing them, so a forgotten clause is
+  caught rather than silently tolerated.
+- PAX **records both options and obeys neither** today. `fillfactor` cannot bound
+  a page below its chunk set — at 20 columns that is ~55% of the usable area, so
+  `fillfactor = 80` would be free but anything lower collapses the table to one
+  row per page. `toast_tuple_target` has nothing to redirect to, PAX having no
+  TOAST. Both are measured and recorded in `analyse1.md`.
+
+=======
+### Test tables
+
+Every table in `sql/pax_am.sql` and `specs/pax_mvcc.spec` has the same shape:
+20 columns — primary key, several integer widths, floats, text — with one column
+per slot stride the format distinguishes (1, 2, 4, 8, 16). Each is created
+`WITH (fillfactor = 80, toast_tuple_target = 512)`.
+
+Two things about that clause are worth knowing before adding a table:
+
+- It is **not inherited**. Neither `LIKE` nor `CREATE TABLE AS` copies
+  reloptions, not even `LIKE ... INCLUDING ALL`. A regression sweep near the end
+  of the suite fails if any PAX table is missing them, so a forgotten clause is
+  caught rather than silently tolerated.
+- PAX **records both options and obeys neither** today. `toast_tuple_target` has
+  nothing to redirect to, PAX having no TOAST, and `fillfactor` is not honoured
+  either — a region grows on demand, so there is no packing decision left to cap.
+  Both are measured and recorded in `analyse1.md`.
+
+>>>>>>> Stashed changes
 To compare shared-buffer usage for one identical query on a `heap` table and
 a `pax` table:
 
@@ -96,29 +137,91 @@ Trois diagrammes SVG illustrent la disposition physique des pages :
 
 - [`docs/heap-page.svg`](docs/heap-page.svg) — page heap classique : line
   pointers, tuples autoporteurs, espace libre central.
+<<<<<<< Updated upstream
 - [`docs/pax-page.svg`](docs/pax-page.svg) — page PAX v4 : aucun line pointer,
   métadonnées columnaires de 32 o par version, une région par colonne, valeurs
   varlena en haut de page.
 - [`docs/pax-page-reelle.svg`](docs/pax-page-reelle.svg) — **une page PAX
   réellement dumpée**, avec les offsets et tailles lus dans les octets bruts.
+||||||| Stash base
+- [`docs/pax-page.svg`](docs/pax-page.svg) — page PAX **v4, format périmé** :
+  une région contiguë par colonne, déplacée à chaque insertion.
+- [`docs/pax-page-v5.svg`](docs/pax-page-v5.svg) — **le format courant (v5)** :
+  chaque colonne est une chaîne de chunks de taille fixe, alloués une fois et
+  jamais déplacés. C'est ce qui donne à une ligne PAX une adresse stable, comme
+  une ligne de heap.
+- [`docs/pax-page-reelle.svg`](docs/pax-page-reelle.svg) — **une page PAX
+  réellement dumpée**, avec les offsets et tailles lus dans les octets bruts.
+  Même outil que `pax-page-v5.svg`, mais sur le cas `ventes` ci-dessous, qui
+  montre les valeurs nulles.
+=======
+- [`docs/pax-page.svg`](docs/pax-page.svg) — **le format courant**, sur une
+  table de 6 colonnes couvrant tous les pas de slot : une région contiguë par
+  colonne, contenant le bitmap de NULL puis les slots.
+- [`docs/pax-page-reelle.svg`](docs/pax-page-reelle.svg) — le même format sur le
+  cas `ventes` ci-dessous, qui montre les valeurs nulles.
+
+Les deux schémas PAX sont produits par le même outil, à partir des octets bruts
+d'une page réelle, et non dessinés à la main.
+>>>>>>> Stashed changes
 
 La comparaison visuelle fait ressortir l'inversion principale : là où heap
 range les tuples en lignes et doit donc traverser tous les en-têtes pour lire
+<<<<<<< Updated upstream
 une colonne, PAX range les colonnes côte à côte et n'a plus qu'à suivre les
 offsets de `PaxPageHeader`.
+||||||| Stash base
+une colonne, PAX range les colonnes côte à côte et n'a plus qu'à suivre les
+chaînes de chunks.
+
+Le passage de v4 à v5 se lit dans le schéma : en v4 les régions vivaient sous
+`pd_lower` et chaque insertion les.memmoveait, en corrigeant `offsets[]` au
+passage. En v5 la zone basse ne porte plus que les métadonnées de version, et
+les slots vivent dans l'arène, au-dessus de `pd_upper`, où chunks et charges
+utiles **s'entrelacent** sur une descente commune. Le schéma les dessine à leur
+vrai offset précisément parce qu'ils se mélangent.
+=======
+une colonne, PAX range les colonnes côte à côte et n'a plus qu'à calculer un
+offset.
+
+Une région PAX est donc **déplacée à chaque insertion** : le slot nouveau est
+ajouté à la fin, et tout ce qui suit est memmové, `offsets[]` corrigé au
+passage. C'est le prix assumé de la simplicité — voir `analyse1.md` §18 pour ce
+que le format à chunks rapporté coûtait et ce qu'il apportait.
+>>>>>>> Stashed changes
 
 ### Régénérer le schéma d'une page réelle
 
-`docs/inspect_pax_page.py` dumper une page avec `pageinspect.get_raw_page()`,
-la décode selon les structures de `pax_am.c`, et produit le SVG :
+`docs/inspect_pax_page.py` dumpe une page avec `pageinspect.get_raw_page()`, la
+décode selon les structures de `pax_am.c`, et produit le SVG :
 
 ```sh
 ./docs/inspect_pax_page.py ventes 0 --db ma_base --verify -o docs/pax-page-reelle.svg
 ```
 
+<<<<<<< Updated upstream
 `--verify` contrôle la cohérence du layout avant de dessiner : régions
 contiguës, total égal à `BLCKSZ`, et taille de chaque région conforme à
 `bitmap_de_NULL + n_tuples × pas`. Le schéma livré a été produit sur la table
+||||||| Stash base
+`--verify` contrôle la cohérence du layout avant de dessiner : chaque chaîne de
+chunks se termine bien sur le maillon désigné par sa queue, `n_rows` ne dépasse
+pas `PAX_CHUNK_MAX_ROWS`, aucun chunk ne déborde de l'arène, et la zone des
+métadonnées fait exactement `n_tuples × 32` octets.
+
+`PAX_CHUNK_MAX_ROWS` est recopié en dur dans le script : il doit être remis à
+jour à la main quand la constante change dans `pax_am.c`, faute de quoi le
+décodeur lirait les chunks au mauvais endroit — silencieusement, et seulement
+sur les tables assez larges pour avoir plus d'un chunk.
+
+Les deux schémas livrés ont été produits sur ces tables :
+=======
+`--verify` contrôle la cohérence du layout avant de dessiner : les régions sont
+contiguës, les `offsets[]` tombent bien dans l'espace utile, et leur total fait
+exactement les 8192 octets de la page.
+
+Les deux schémas livrés ont été produits sur ces tables :
+>>>>>>> Stashed changes
 
 ```sql
 CREATE TABLE ventes (id integer, nom text, quantite integer) USING pax;
@@ -126,10 +229,42 @@ INSERT INTO ventes SELECT g,
        CASE WHEN g % 11 = 0 THEN NULL ELSE 'client-' || g END,
        CASE WHEN g % 7  = 0 THEN NULL ELSE (g * 3) % 1000 END
 FROM generate_series(1, 120) g;
+<<<<<<< Updated upstream
+||||||| Stash base
+
+-- docs/pax-page-v5.svg : 6 colonnes, tous les pas de slot
+CREATE TABLE demo (id integer, label text, small integer,
+                   ratio double precision, note text, flag boolean) USING pax;
+INSERT INTO demo SELECT g, 'ligne ' || g, g % 97, g * 1.5::float8,
+       CASE WHEN g % 4 = 0 THEN NULL ELSE 'note-' || g END,
+       (g % 2 = 0)
+FROM generate_series(1, 200) g;
+=======
+
+-- docs/pax-page.svg : 6 colonnes, tous les pas de slot
+CREATE TABLE demo (id integer, label text, small integer,
+                   ratio double precision, note text, flag boolean) USING pax;
+INSERT INTO demo SELECT g, 'ligne ' || g, g % 97, g * 1.5::float8,
+       CASE WHEN g % 4 = 0 THEN NULL ELSE 'note-' || g END,
+       (g % 2 = 0)
+FROM generate_series(1, 200) g;
+>>>>>>> Stashed changes
 ```
 
+<<<<<<< Updated upstream
 soit 114 versions sur le bloc 0, 40 octets libres, et 10 / 16 valeurs nulles
 respectivement dans `nom` et `quantite`.
+||||||| Stash base
+Soit 120 versions sur le bloc 0 de `ventes`, et 96 sur celui de `demo` avec
+trois chunks de 32 versions par colonne et 24 valeurs nulles dans `note`. Les
+chunks et les charges utiles sont entrelacés dans l'arène, ce que montre la
+dernière section de chaque schéma : ils sont dessinés à leur vrai offset, dans
+l'ordre des adresses, et non empilés en deux zones.
+=======
+Soit 120 versions sur le bloc 0 de `ventes`, et 200 sur celui de `demo` avec 50
+valeurs nulles dans `note`.
+
+>>>>>>> Stashed changes
 
 See `analyse1.md` for the current format, algorithms, test coverage, and known
 limitations.

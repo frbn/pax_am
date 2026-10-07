@@ -7,7 +7,14 @@
 <rect class="f" x="120" y="82" width="470" height="62" fill="#dbe4ee"/>
 <text class="b" x="134" y="100">PageHeaderData</text>
 <text class="zr" x="576" y="100" text-anchor="end">24 o — offset 0</text>
+<<<<<<< Updated upstream
 <text class="z m" x="134" y="116">pd_lsn 0x906EA99000000000 · pd_checksum 0 · pd_flags 0</text>
+||||||| Stash base
+<text class="z m" x="134" y="116">pd_lsn 0xDBDF1FE000000001 · pd_checksum 0 · pd_flags 0</text>
+<text class="z m" x="134" y="130">pd_lower <tspan font-weight='600'>3896</tspan> · pd_upper <tspan font-weight='600'>4952</tspan> · pd_special 8184</text>
+=======
+<text class="z m" x="134" y="116">pd_lsn 0xECF2E1A000000001 · pd_checksum 0 · pd_flags 0</text>
+>>>>>>> Stashed changes
 <text class="z m" x="134" y="130">pd_lower <tspan font-weight='600'>5136</tspan> · pd_upper <tspan font-weight='600'>6424</tspan> · pd_special 8184</text>
 <rect class="f" x="120" y="144" width="470" height="20" fill="#eef2f6" stroke-dasharray="4 2"/>
 <text class="z" x="134" y="158">padding d'alignement — PaxPageHeaderPtr = page + 24 + 8</text>
@@ -22,15 +29,45 @@
 <text class="zr" x="576" y="240" text-anchor="end">120 × 32 = 3840 o</text>
 <text class="z m" x="134" y="254">offsets [0..3839] — une PaxTupleMetaData par version</text>
 <rect x="134" y="262" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<<<<<<< Updated upstream
 <text class="z m" x="140" y="273">v0  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+||||||| Stash base
+<text class="z m" x="140" y="273">v0  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+=======
+<text class="z m" x="140" y="273">v0  xmin 14379  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+>>>>>>> Stashed changes
 <rect x="134" y="278" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<<<<<<< Updated upstream
 <text class="z m" x="140" y="289">v1  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+||||||| Stash base
+<text class="z m" x="140" y="289">v1  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+=======
+<text class="z m" x="140" y="289">v1  xmin 14379  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+>>>>>>> Stashed changes
 <rect x="134" y="294" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<<<<<<< Updated upstream
 <text class="z m" x="140" y="305">v2  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+||||||| Stash base
+<text class="z m" x="140" y="305">v2  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+=======
+<text class="z m" x="140" y="305">v2  xmin 14379  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+>>>>>>> Stashed changes
 <rect x="134" y="310" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<<<<<<< Updated upstream
 <text class="z m" x="140" y="321">v3  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+||||||| Stash base
+<text class="z m" x="140" y="321">v3  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+=======
+<text class="z m" x="140" y="321">v3  xmin 14379  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+>>>>>>> Stashed changes
 <rect x="134" y="326" width="442" height="14" fill="#f0b6bd" stroke="#cf8891" stroke-width="1"/>
+<<<<<<< Updated upstream
 <text class="z m" x="140" y="337">v4  xmin 5406  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+||||||| Stash base
+<text class="z m" x="140" y="337">v4  xmin 12986  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+=======
+<text class="z m" x="140" y="337">v4  xmin 14379  xmax 0  cmin 0  cmax —  mxid 0  t_ctid → soi-même</text>
+>>>>>>> Stashed changes
 <text class="z" x="140" y="346">… 115 versions supplémentaires</text>
 <rect class="f" x="120" y="356" width="470" height="88" fill="#cfe3d3"/>
 <text class="b" x="134" y="374">Région colonne 0 — id (int4)</text>

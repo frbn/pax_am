@@ -6,6 +6,90 @@
 -- scans / pg_relation_size / INSERT ... SELECT / TRUNCATE / DROP,
 -- including a round-trip over one row of many different data types.
 --
+<<<<<<< Updated upstream
+||||||| Stash base
+-- Toutes les tables de ce fichier ont la meme forme : 20 colonnes, une clef
+-- primaire, des entiers, des flottants et du texte. C'est deliberé.
+--
+-- Le format v5 range les slots par colonnes dans des chunks de taille fixe
+-- (PAX_CHUNK_MAX_ROWS = 32). Un jeu de chunks occupe
+-- n_attrs x (16 + 32 x pas), et il doit tenir dans une page : a 20 colonnes
+-- melangees cela fait 4352 octets, contre 8192 disponibles. Une table large
+-- exerce donc la contrainte qui compte, alors que deux colonnes ne verifient
+-- que la partie triviale de la geometrie.
+--
+-- Les colonnes couvrent tous les pas de slot que le format distingue :
+--   1 o  (bool, "char")        2 o  (text, numeric, varlena)
+--   4 o  (int4, real, date)   8 o  (int8, float8, timestamp)
+--  16 o  (interval, uuid)
+--
+-- Ce sont les pas qui comptent, pas les noms de type : PAX copie des octets de
+-- Datum et n'a pas de code par type. Les colonnes de la version a 2 colonnes
+-- qui ont disparu -- time (8 o), oid (4 o), varchar (2 o), numeric sans
+-- précision (2 o) -- retombaient chacune sur un pas déjà couvert deux fois.
+-- Un type d'un pas inédit serait en revanche un vrai manque, d'où cette liste.
+--
+-- Chaque table porte aussi les mêmes paramètres de stockage :
+--
+--   WITH (fillfactor = 80, toast_tuple_target = 512)
+--
+-- Le WITH est répété partout, et c'est délibéré. Ni LIKE (même avec INCLUDING
+-- ALL ou INCLUDING STORAGE) ni CREATE TABLE AS ne recopient reloptions, et
+-- PostgreSQL 19 ne donne pas à un AM de table le moyen d'injecter ses propres
+-- valeurs par défaut : TableAmRoutine n'a pas de callback d'options, et
+-- DefineRelation() valide et enregistre reloptions avant que l'AM ne soit
+-- appelé. Donc une table dérivée par LIKE n'aurait rien, et il faudrait l'écrire
+-- -- le test de la section « paramètres de stockage » plus bas verrouille ce
+-- comportement pour qu'on ne le croie pas involontairement.
+--
+-- Voir la section « paramètres de stockage » pour ce que ces deux valeurs font
+-- et ne font pas aujourd'hui : PAX les enregistre, et n'en obéit pas encore.
+--
+CREATE EXTENSION pax_am;
+=======
+-- Toutes les tables de ce fichier ont la meme forme : 20 colonnes, une clef
+-- primaire, des entiers, des flottants et du texte. C'est deliberé.
+--
+-- Le format courant range les slots par colonnes dans une région contiguë par
+-- colonne : bitmap de NULL puis les slots, sans suralignement. La région est
+-- déplacée (memmove) à chaque insertion, et offsets[] corrigé au passage — c'est
+-- le prix assumé de la simplicité, voir analyse1.md sections 3 et 18.
+--
+-- 20 colonnes exerce la contrainte qui compte : 32 octets de métadonnées par
+-- version, plus les bitmap, plus les charges utiles hors ligne, à 20 colonnes
+-- mélangées. Deux colonnes ne vérifieraient que la partie triviale de la
+-- géométrie — et c'est exactement le sous-ensemble sur lequel le format à
+-- chunks de la version 5 avait été mesuré.
+--
+-- Les colonnes couvrent tous les pas de slot que le format distingue :
+--   1 o  (bool, "char")        2 o  (text, numeric, varlena)
+--   4 o  (int4, real, date)   8 o  (int8, float8, timestamp)
+--  16 o  (interval, uuid)
+--
+-- Ce sont les pas qui comptent, pas les noms de type : PAX copie des octets de
+-- Datum et n'a pas de code par type. Les colonnes de la version a 2 colonnes
+-- qui ont disparu -- time (8 o), oid (4 o), varchar (2 o), numeric sans
+-- précision (2 o) -- retombaient chacune sur un pas déjà couvert deux fois.
+-- Un type d'un pas inédit serait en revanche un vrai manque, d'où cette liste.
+--
+-- Chaque table porte aussi les mêmes paramètres de stockage :
+--
+--   WITH (fillfactor = 80, toast_tuple_target = 512)
+--
+-- Le WITH est répété partout, et c'est délibéré. Ni LIKE (même avec INCLUDING
+-- ALL ou INCLUDING STORAGE) ni CREATE TABLE AS ne recopient reloptions, et
+-- PostgreSQL 19 ne donne pas à un AM de table le moyen d'injecter ses propres
+-- valeurs par défaut : TableAmRoutine n'a pas de callback d'options, et
+-- DefineRelation() valide et enregistre reloptions avant que l'AM ne soit
+-- appelé. Donc une table dérivée par LIKE n'aurait rien, et il faudrait l'écrire
+-- -- le test de la section « paramètres de stockage » plus bas verrouille ce
+-- comportement pour qu'on ne le croie pas involontairement.
+--
+-- Voir la section « paramètres de stockage » pour ce que ces deux valeurs font
+-- et ne font pas aujourd'hui : PAX les enregistre, et n'en obéit pas encore.
+--
+CREATE EXTENSION pax_am;
+>>>>>>> Stashed changes
 
 CREATE EXTENSION pax_am;
 
@@ -24,6 +108,209 @@ WHERE amname = 'pax';
 SELECT extname, extversion FROM pg_extension WHERE extname = 'pax_am';
 
 --
+<<<<<<< Updated upstream
+||||||| Stash base
+-- storage parameters
+--
+-- Every table below is created WITH (fillfactor = 80, toast_tuple_target =
+-- 512). This section pins down three separate things, which are easy to
+-- conflate: that PostgreSQL accepts and records the values, that they can be
+-- changed afterwards, and what the PAX AM currently does with them. The third
+-- is "nothing", and that is asserted rather than assumed.
+--
+
+-- Recorded verbatim, in the order given.
+CREATE TABLE tpax_opt (id int, v text)
+USING pax WITH (fillfactor = 80, toast_tuple_target = 512);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+
+-- A table created WITHOUT the clause has no reloptions at all: PAX does not
+-- inject defaults of its own. It cannot. TableAmRoutine has no options
+-- callback in PG19, and DefineRelation() validates and stores reloptions
+-- before table_relation_set_new_filelocator() ever runs, so by the time the AM
+-- is entered pg_class is already committed to a value it did not choose.
+CREATE TABLE tpax_opt_bare (id int, v text) USING pax;
+SELECT coalesce(reloptions::text, '(none)') AS reloptions FROM pg_class
+WHERE relname = 'tpax_opt_bare';
+
+-- Nothing is recorded, not even a default. PostgreSQL's own fallbacks
+-- (fillfactor 100, toast_tuple_target TOAST_TUPLE_THRESHOLD) live in
+-- rd_options, in memory, and are only visible to the AM -- there is no SQL to
+-- read them back through, which is exactly why the empty catalog row above is
+-- the only evidence available from a test.
+SELECT reloptions IS NULL AS nothing_recorded_for_a_bare_table
+FROM pg_class WHERE relname = 'tpax_opt_bare';
+
+-- Changing them after the fact goes through ALTER TABLE, like any table.
+ALTER TABLE tpax_opt SET (fillfactor = 60);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+ALTER TABLE tpax_opt RESET (fillfactor);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+
+-- Out-of-range values are refused by PostgreSQL's own bounds, at CREATE and at
+-- ALTER alike. Recorded here because the bounds differ per option and a
+-- regression in either would show up as a golden change and nothing else.
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (fillfactor = 101);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (fillfactor = 9);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (toast_tuple_target = 127);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (toast_tuple_target = 8161);
+ALTER TABLE tpax_opt SET (toast_tuple_target = 1);
+
+-- LIKE does not carry storage parameters over -- not even INCLUDING ALL, not
+-- even INCLUDING STORAGE. This is the trap: almost every table below is built
+-- with LIKE, so putting the clause on one base table and trusting inheritance
+-- would leave the rest of the suite with no parameters at all.
+CREATE TABLE tpax_opt_like (LIKE tpax_opt INCLUDING ALL) USING pax;
+CREATE TABLE tpax_opt_ctas AS SELECT * FROM tpax_opt;
+SELECT c.relname, coalesce(c.reloptions::text, '(none)') AS reloptions
+FROM pg_class c
+WHERE c.relname LIKE 'tpax_opt%' AND c.relkind = 'r'
+ORDER BY c.relname;
+
+-- PAX never builds a TOAST table, whatever toast_tuple_target says: the AM's
+-- relation_needs_toast_table() answers false. A value well past the 512 target
+-- is therefore stored inline, in the arena, and reads back unchanged.
+SELECT reltoastrelid = 0 AS no_toast_table FROM pg_class WHERE relname = 'tpax_opt';
+INSERT INTO tpax_opt VALUES (1, repeat('x', 2000));
+SELECT id, length(v) AS stored_inline, v = repeat('x', 2000) AS reads_back
+FROM tpax_opt;
+
+-- And fillfactor does not currently bound how full a page gets. Two tables
+-- filled identically, one at 10 and one at 100, cost exactly the same, which is
+-- what "recorded but not obeyed" looks like from the outside. Comparing the two
+-- rather than pinning an absolute page count keeps the assertion meaningful if
+-- the geometry ever changes: what is being tested is the *absence* of an
+-- effect, and that stays true across a layout change.
+--
+-- Obeying it is not automatically a cost, either, and the measurement is worth
+-- recording because the first guess was wrong. A throwaway patch capping the
+-- consumed fraction of each page at fillfactor, on 2 000 rows:
+--
+--     fillfactor      12 col     20 col
+--          100       26 pages   63 pages
+--           80       26 pages   63 pages      <- no change at all
+--           30       61 pages  2000 pages     <- one row per page
+--
+-- 80 is free because a PAX page is already more than half consumed before its
+-- first row: at 20 columns the chunk set alone is 4352 o, about 55% of the
+-- usable area, so an 80% cap never binds on the data that is actually there.
+-- Below that threshold it collapses, because the chunk set no longer fits
+-- inside the cap and every row needs a fresh page. So the window for
+-- fillfactor on a wide table is roughly [chunk-set fraction, 100], and 80 sits
+-- inside it. Honouring the option is therefore a policy decision, not a
+-- performance cliff -- and it is not implemented, so the test says so rather
+-- than letting the clause imply otherwise.
+CREATE TABLE tpax_opt_ff_lo (id int, v text)
+USING pax WITH (fillfactor = 10, toast_tuple_target = 512);
+INSERT INTO tpax_opt_ff_lo SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+CREATE TABLE tpax_opt_ff_hi (LIKE tpax_opt_ff_lo INCLUDING DEFAULTS)
+USING pax WITH (fillfactor = 100, toast_tuple_target = 512);
+INSERT INTO tpax_opt_ff_hi SELECT * FROM tpax_opt_ff_lo;
+SELECT (SELECT pg_relation_size('tpax_opt_ff_lo') / 8192) AS pages_at_fillfactor_10,
+       (SELECT pg_relation_size('tpax_opt_ff_hi') / 8192) AS pages_at_fillfactor_100,
+       (SELECT pg_relation_size('tpax_opt_ff_lo')
+          = pg_relation_size('tpax_opt_ff_hi')) AS fillfactor_has_no_effect_yet;
+DROP TABLE tpax_opt_ff_lo, tpax_opt_ff_hi, tpax_opt_ctas, tpax_opt_like,
+           tpax_opt_bare, tpax_opt;
+
+--
+=======
+-- storage parameters
+--
+-- Every table below is created WITH (fillfactor = 80, toast_tuple_target =
+-- 512). This section pins down three separate things, which are easy to
+-- conflate: that PostgreSQL accepts and records the values, that they can be
+-- changed afterwards, and what the PAX AM currently does with them. The third
+-- is "nothing", and that is asserted rather than assumed.
+--
+
+-- Recorded verbatim, in the order given.
+CREATE TABLE tpax_opt (id int, v text)
+USING pax WITH (fillfactor = 80, toast_tuple_target = 512);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+
+-- A table created WITHOUT the clause has no reloptions at all: PAX does not
+-- inject defaults of its own. It cannot. TableAmRoutine has no options
+-- callback in PG19, and DefineRelation() validates and stores reloptions
+-- before table_relation_set_new_filelocator() ever runs, so by the time the AM
+-- is entered pg_class is already committed to a value it did not choose.
+CREATE TABLE tpax_opt_bare (id int, v text) USING pax;
+SELECT coalesce(reloptions::text, '(none)') AS reloptions FROM pg_class
+WHERE relname = 'tpax_opt_bare';
+
+-- Nothing is recorded, not even a default. PostgreSQL's own fallbacks
+-- (fillfactor 100, toast_tuple_target TOAST_TUPLE_THRESHOLD) live in
+-- rd_options, in memory, and are only visible to the AM -- there is no SQL to
+-- read them back through, which is exactly why the empty catalog row above is
+-- the only evidence available from a test.
+SELECT reloptions IS NULL AS nothing_recorded_for_a_bare_table
+FROM pg_class WHERE relname = 'tpax_opt_bare';
+
+-- Changing them after the fact goes through ALTER TABLE, like any table.
+ALTER TABLE tpax_opt SET (fillfactor = 60);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+ALTER TABLE tpax_opt RESET (fillfactor);
+SELECT reloptions FROM pg_class WHERE relname = 'tpax_opt';
+
+-- Out-of-range values are refused by PostgreSQL's own bounds, at CREATE and at
+-- ALTER alike. Recorded here because the bounds differ per option and a
+-- regression in either would show up as a golden change and nothing else.
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (fillfactor = 101);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (fillfactor = 9);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (toast_tuple_target = 127);
+CREATE TABLE tpax_opt_bad (id int) USING pax WITH (toast_tuple_target = 8161);
+ALTER TABLE tpax_opt SET (toast_tuple_target = 1);
+
+-- LIKE does not carry storage parameters over -- not even INCLUDING ALL, not
+-- even INCLUDING STORAGE. This is the trap: almost every table below is built
+-- with LIKE, so putting the clause on one base table and trusting inheritance
+-- would leave the rest of the suite with no parameters at all.
+CREATE TABLE tpax_opt_like (LIKE tpax_opt INCLUDING ALL) USING pax;
+CREATE TABLE tpax_opt_ctas AS SELECT * FROM tpax_opt;
+SELECT c.relname, coalesce(c.reloptions::text, '(none)') AS reloptions
+FROM pg_class c
+WHERE c.relname LIKE 'tpax_opt%' AND c.relkind = 'r'
+ORDER BY c.relname;
+
+-- PAX never builds a TOAST table, whatever toast_tuple_target says: the AM's
+-- relation_needs_toast_table() answers false. A value well past the 512 target
+-- is therefore stored inline, in the arena, and reads back unchanged.
+SELECT reltoastrelid = 0 AS no_toast_table FROM pg_class WHERE relname = 'tpax_opt';
+INSERT INTO tpax_opt VALUES (1, repeat('x', 2000));
+SELECT id, length(v) AS stored_inline, v = repeat('x', 2000) AS reads_back
+FROM tpax_opt;
+
+-- And fillfactor does not currently bound how full a page gets. Two tables
+-- filled identically, one at 10 and one at 100, cost exactly the same, which is
+-- what "recorded but not obeyed" looks like from the outside. Comparing the two
+-- rather than pinning an absolute page count keeps the assertion meaningful if
+-- the geometry ever changes: what is being tested is the *absence* of an
+-- effect, and that stays true across a layout change.
+--
+-- Obeying it is a policy decision, not a tuning knob, and it is not
+-- implemented. Under the chunked format it was measurable and had a cliff: a
+-- page was already more than half consumed by its chunk set before the first
+-- row, so an 80% cap cost nothing while 30% collapsed the table to one row per
+-- page. That cliff belonged to the chunk set and is gone with it. What would
+-- remain on this format is the ordinary trade -- reserved free space buys
+-- co-location of later versions on the same page, and costs the space -- and
+-- that is not measured here, so the test states the behaviour rather than
+-- implying the option is live.
+CREATE TABLE tpax_opt_ff_lo (id int, v text)
+USING pax WITH (fillfactor = 10, toast_tuple_target = 512);
+INSERT INTO tpax_opt_ff_lo SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+CREATE TABLE tpax_opt_ff_hi (LIKE tpax_opt_ff_lo INCLUDING DEFAULTS)
+USING pax WITH (fillfactor = 100, toast_tuple_target = 512);
+INSERT INTO tpax_opt_ff_hi SELECT * FROM tpax_opt_ff_lo;
+SELECT (SELECT pg_relation_size('tpax_opt_ff_lo') / 8192) AS pages_at_fillfactor_10,
+       (SELECT pg_relation_size('tpax_opt_ff_hi') / 8192) AS pages_at_fillfactor_100,
+       (SELECT pg_relation_size('tpax_opt_ff_lo')
+          = pg_relation_size('tpax_opt_ff_hi')) AS fillfactor_has_no_effect_yet;
+DROP TABLE tpax_opt_ff_lo, tpax_opt_ff_hi, tpax_opt_ctas, tpax_opt_like,
+           tpax_opt_bare, tpax_opt;
+
+--
+>>>>>>> Stashed changes
 -- table lifecycle (this used to segfault: relation_set_new_filelocator
 -- was NULL in pax_methods)
 --
@@ -53,13 +340,41 @@ SELECT a, b FROM tpax ORDER BY a;
 SELECT ctid, a FROM tpax ORDER BY a LIMIT 1;
 
 --
+<<<<<<< Updated upstream
 -- many rows: forces several pages in pax_tuple_insert and
 -- grows the per-column NULL bitmap past its first 64-tuple capacity
+||||||| Stash base
+-- many rows: forces several pages in pax_tuple_insert, opens a second chunk
+-- per column (PAX_CHUNK_MAX_ROWS = 32), and grows every NULL bitmap past
+-- its first byte
+=======
+-- many rows: forces several pages in pax_tuple_insert, so every column region
+-- has to grow past its first 8 NULLs and be memmoved more than once, and every
+-- NULL bitmap grows past its first byte
+>>>>>>> Stashed changes
 --
 INSERT INTO tpax SELECT g, 'row ' || g FROM generate_series(3, 502) g;
 SELECT count(*) FROM tpax;
+<<<<<<< Updated upstream
 SELECT count(*) FROM tpax WHERE b LIKE 'row %';
 SELECT a, b FROM tpax WHERE a = 250;
+||||||| Stash base
+SELECT count(*) FROM tpax WHERE t1 LIKE 'texte %';
+SELECT id, k2, k4, f8, t1, t4, uu FROM tpax WHERE id = 250;
+-- the NULL bitmap must round-trip at both ends of a chunk
+SELECT count(*) FILTER (WHERE t4 IS NULL) AS t4_null,
+       count(*) FILTER (WHERE t_null IS NULL) AS t_null_null,
+       count(*) FILTER (WHERE t4 IS NULL AND t_null IS NULL) AS both_null
+FROM tpax;
+=======
+SELECT count(*) FROM tpax WHERE t1 LIKE 'texte %';
+SELECT id, k2, k4, f8, t1, t4, uu FROM tpax WHERE id = 250;
+-- the NULL bitmap must round-trip across the growth of its region
+SELECT count(*) FILTER (WHERE t4 IS NULL) AS t4_null,
+       count(*) FILTER (WHERE t_null IS NULL) AS t_null_null,
+       count(*) FILTER (WHERE t4 IS NULL AND t_null IS NULL) AS both_null
+FROM tpax;
+>>>>>>> Stashed changes
 SELECT pg_relation_size('tpax') > 16384 AS spans_pages;
 
 --
@@ -232,6 +547,24 @@ SELECT array_agg(id ORDER BY id) AS ids_after_rollback FROM tpax_dml;
 
 -- A replacement that cannot fit is rejected after reserving the old version;
 -- rolling back that subtransaction makes the old version current again.
+<<<<<<< Updated upstream
+||||||| Stash base
+--
+-- At 20 columns the ceiling is much lower than a bare page: a new page must
+-- also pay the whole chunk set (4352 o here), so anything past ~3.7 KB of
+-- payload is refused. The refusal used to come out as a low-level FSM error
+-- ("invalid FSM request size") instead, because the space hint asked the FSM
+-- for more than the FSM can represent; it must now be the row-size error, and
+-- the old version must still be there afterwards.
+=======
+--
+-- A row of 20 columns cannot grow without limit into one page: the regions
+-- plus the metadata plus the payload must all fit, which puts the ceiling near
+-- 7760 bytes for a single large value here. The refusal used to come out as a
+-- low-level FSM error ("invalid FSM request size") instead, because the space
+-- hint asked the FSM for more than the FSM can represent; it must be the
+-- row-size error, and the old version must still be there afterwards.
+>>>>>>> Stashed changes
 BEGIN;
 SAVEPOINT pax_large_update_sp;
 UPDATE tpax_dml SET payload = repeat('x', 10000) WHERE id = 2;
@@ -254,7 +587,27 @@ DROP TABLE tpax_dml;
 
 -- Force a replacement version onto another page and verify that the 32-bit
 -- block plus 16-bit offset t_ctid link is followed by later version locking.
+<<<<<<< Updated upstream
 CREATE TABLE tpax_chain (id int, payload text) USING pax;
+||||||| Stash base
+--
+-- The 3700-byte payload is chosen against the geometry, not by habit: it must
+-- exceed the free space left on the row's own page yet still fit on a fresh
+-- one. On this schema the chunk set is 4352 o, so a fresh page has ~3.7 KB for
+-- payloads and the boundary falls just there. 1000 o would stay in place, and
+-- 5000 o no longer fits at all -- see the tpax_dml case above, which asserts
+-- that refusal.
+CREATE TABLE tpax_chain (LIKE tpax INCLUDING DEFAULTS) USING pax
+WITH (fillfactor = 80, toast_tuple_target = 512);
+=======
+--
+-- The 3700-byte payload is chosen against the geometry, not by habit: it must
+-- exceed the free space left on the row's own page yet still fit on a fresh
+-- one. A smaller value would stay in place and assert nothing; the ceiling
+-- itself is pinned by the tpax_dml case above.
+CREATE TABLE tpax_chain (LIKE tpax INCLUDING DEFAULTS) USING pax
+WITH (fillfactor = 80, toast_tuple_target = 512);
+>>>>>>> Stashed changes
 INSERT INTO tpax_chain
 SELECT g, repeat('x', 50) FROM generate_series(0, 99) g;
 SELECT ctid AS old_tid FROM tpax_chain WHERE id = 0 \gset
@@ -303,7 +656,25 @@ DELETE FROM tpax_vacuum WHERE id <= 50;
 
 VACUUM tpax_vacuum;
 
+<<<<<<< Updated upstream
 -- The surviving chain must still read back exactly as before.
+||||||| Stash base
+-- The surviving chain must still read back exactly as before. Checking
+-- one text column is not enough at this width: the replacement version also
+-- rewrites every other column, so a chunk or a payload that had moved would
+-- show up in a float or in a NULL bit.
+--
+-- t2 was seeded to repeat('x',30) || g, so its expected value is that same
+-- seed plus the suffix each UPDATE appended.
+=======
+-- The surviving chain must still read back exactly as before. Checking
+-- one text column is not enough at this width: the replacement version also
+-- rewrites every other column, so a region or a payload that had moved would
+-- show up in a float or in a NULL bit.
+--
+-- t2 was seeded to repeat('x',30) || g, so its expected value is that same
+-- seed plus the suffix each UPDATE appended.
+>>>>>>> Stashed changes
 SELECT count(*) AS vacuum_rows,
        count(*) FILTER (WHERE payload <> expected) AS mismatched
 FROM (
