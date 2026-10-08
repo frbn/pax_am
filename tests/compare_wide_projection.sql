@@ -221,20 +221,49 @@ $$;
 
 \echo ''
 \echo '--- Where the extra PAX pages come from ---------------------------'
-\echo 'Measured per row, from the page layout itself (not estimated):'
+\echo 'Every figure below is measured from the catalog at run time and'
+\echo 'interpolated, so it cannot drift away from the format the way a'
+\echo 'hand-written figure does. The one thing stated rather than measured is'
+\echo 'the payload, because it is arithmetic on the schema: eleven 60-char'
+\echo 'text columns, each a 61-byte varlena, each MAXALIGNed to 64 bytes.'
+
+SELECT 11 * 64 AS payload_b_per_row \gset
+SELECT (SELECT count(*) FROM heap_wide) AS n \gset
+SELECT pg_relation_size('heap_wide') / 8192 AS heap_pages \gset
+SELECT pg_relation_size('pax_wide')  / 8192 AS pax_pages  \gset
+SELECT round(pg_relation_size('heap_wide')::numeric / :n, 1) AS heap_bpr \gset
+SELECT round(pg_relation_size('pax_wide')::numeric  / :n, 1) AS pax_bpr  \gset
+SELECT round(:pax_bpr - :heap_bpr, 1) AS bpr_gap \gset
+SELECT round(:n::numeric / :heap_pages, 2) AS heap_rows_per_page \gset
+SELECT round(:n::numeric / :pax_pages,  2) AS pax_rows_per_page  \gset
+SELECT round(:pax_pages::numeric / :heap_pages, 3) AS page_ratio \gset
+
 \echo ''
-\echo '  PAX : 32 B PaxTupleMetaData + ~36 B of slot/offset arrays per row'
-\echo '        payload zone pd_upper..pd_special = ~705 B/row (same as heap)'
-\echo '        => ~772 B/row, and only 10 rows fit in 8192 B'
-\echo '  heap : ~25 B HeapTupleHeader + 4 B ItemIdData line pointer per row'
-\echo '        => ~703 B/row, and 11 rows fit in 8192 B'
+\echo '  payload value bytes, same for both :' :payload_b_per_row 'B/row'
+\echo '  heap, everything but payload    :' :heap_bpr 'B/row'
+\echo '  pax,  everything but payload    :' :pax_bpr 'B/row'
 \echo ''
-\echo 'So PAX carries ~68 B/row of overhead against heap ~29 B/row. The payload'
-\echo 'is the same size; only the bookkeeping differs. 11 rows x 772 B = 8492 B'
-\echo 'does not fit in an 8192 B page, which is exactly why PAX needs 10% more'
-\echo 'pages -- and therefore reports 10% more shared blocks for the identical'
-\echo 'query. The ~404 B of slack left on each PAX page cannot recover it:'
-\echo '7788 B / 772 B is still only 10 rows.'
+\echo '  heap :' :heap_pages 'pages,' :heap_rows_per_page 'rows/page'
+\echo '  pax  :' :pax_pages  'pages,' :pax_rows_per_page  'rows/page'
+\echo ''
+\echo 'PAX spends' :bpr_gap 'B/row more on bookkeeping than heap, and that is the'
+\echo 'whole difference -- the payload is byte-identical. For PAX that'
+\echo 'bookkeeping is the 32-byte PaxTupleMetaData per version plus, per column,'
+\echo 'a NULL bitmap and one 2-byte offset. For heap it is the HeapTupleHeader'
+\echo 'plus a 4-byte ItemIdData line pointer.'
+\echo ''
+\echo 'That gap decides the row count, because a page is only 8192 bytes:'
+\echo 'measured, heap fits' :heap_rows_per_page 'rows per page and PAX fits'
+\echo :pax_rows_per_page '-- the' :page_ratio 'x page ratio that the shared-buffer figures'
+\echo 'above report for the identical query.'
+\echo ''
+\echo 'One trap worth naming: do NOT re-derive that boundary by multiplying the'
+\echo 'bytes-per-row figures above by the row count. Those figures are relation'
+\echo 'sizes divided by rows, so each one already contains its share of the'
+\echo 'per-page PageHeaderData; multiplying by 11 counts the page header eleven'
+\echo 'times and can produce a figure above 8192 for a table that demonstrably'
+\echo 'fits 11 rows. The measured rows-per-page is the fact; the average is only'
+\echo 'a way to attribute the difference to bookkeeping.'
 \echo ''
 \echo '--- How to read the block counts -----------------------------------'
 \echo 'Shared buffers count PAGES, not bytes, and PostgreSQL reads a whole 8 kB'
@@ -248,7 +277,12 @@ $$;
 \echo 'where a page-resident columnar layout structurally cannot win. The'
 \echo 'narrow-projection advantage needs column segments in SEPARATE relations,'
 \echo 'or a buffer manager that can fetch part of a page. Neither exists today.'
-\echo 'Where PAX does measure well is compressed size (0.82x-1.04x) and'
-\echo 'all-columns scan time; both are reported elsewhere.'
+\echo ''
+\echo 'Where PAX does measure well -- compressed size, and full-width scan time'
+\echo '-- is reported by tests/benchmark_columnar.sh, which measures it on this'
+\echo 'pass. No figure is quoted here on its authority: this script never'
+\echo 'measures compressed size, so a range written into this note would be a'
+\echo 'number carried over from someone else''s session -- which is exactly'
+\echo 'how the 0.82x-1.04x that used to sit here went stale.'
 \echo ''
 \echo 'Benchmark completed.'

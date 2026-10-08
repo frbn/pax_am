@@ -146,18 +146,26 @@ for name, v in wins.items():
         verdict = f"PAX gagne sur {v}/{n_}" + (f", {t} égalité(s)" if t else "")
     print(f"   {name:<17} {verdict}")
 print()
-PY
 
-cat <<'NOTE'
- Où en est PAX aujourd'hui :
 
-   « taille compressée » est le seul avantage réellement mesuré. PAX occupe
-   1,3x à 2x plus d'espace brut que heap, mais une fois compressé il retombe
-   autour de la taille de heap, voire en dessous. La disposition columnaire
-   range des valeurs de même type côte à côte, ce qui compense la surcharge
-   brute. C'est utile pour les sauvegardes, l'archivage et le stockage froid, et
-   c'est la précondition d'une compression embarquée (PAX_FLAG_COMPRESSED existe
-   mais n'est pas implémenté).
+def rng(label, key_p, key_h, fmt="{:.2f}x"):
+    """Fourchette min..max mesuree sur les schemas, jamais une valeur tapee."""
+    vals = [r[key_p] / r[key_h] for r in recs]
+    lo, hi = min(vals), max(vals)
+    if abs(hi - lo) < 0.005:
+        return f"{fmt.format(lo)}"
+    return f"{fmt.format(lo)} a {fmt.format(hi)}"
+
+
+print(" Ou en est PAX aujourd'hui :")
+print(" " + "-" * 76)
+print("""
+   « taille compressée » est le seul avantage réellement mesuré. Sur l'espace
+   brut, PAX est à {} de la taille de heap ; une fois compressé, il retombe à
+   {}. La disposition columnaire range des valeurs de même type côte à côte,
+   ce qui compense la surcharge brute. C'est utile pour les sauvegardes,
+   l'archivage et le stockage froid, et c'est la précondition d'une compression
+   embarquée (PAX_FLAG_COMPRESSED existe mais n'est pas implémenté).
 
    Taille brute et vitesse de lecture sont défavorables à PAX en l'état :
      - 32 octets de métadonnées par version, contre 24 pour un HeapTupleHeader ;
@@ -169,6 +177,18 @@ cat <<'NOTE'
    La projection partielle, argument central du stockage columnaire, n'est pas
    encore exploitée : le scan ne connaît pas la liste des attributs demandés et
    reconstruit toutes les régions, puis matérialise la tupline entière. C'est ce
-   qui explique l'écart de 7x à 9x sur la lecture projetée — l'inverse exact de
-   ce qu'on attendrait d'un stockage columnaire. Voir analyse1.md, sections 8 et 12.
-NOTE
+   qui explique l'écart de {} sur la lecture projetée — l'inverse exact de ce
+   qu'on attendrait d'un stockage columnaire. Voir analyse1.md, sections 8 et 12.
+
+   (Les trois chiffres ci-dessus sont mesurés sur les schémas du présent
+   passage, pas recopiés d'une session précédente.)
+""".format(
+    # Index dans le tuple (sch, hs, ps, hg, pz, phh, php, fhh, fhp) :
+    #   1/2 pages heap/pax, 3/4 compresse, 5/6 lecture projetee, 7/8 lecture complete.
+    rng("", 2, 1),
+    rng("", 4, 3),
+    rng("", 6, 5),
+))
+print(" " + "-" * 76)
+PY
+
