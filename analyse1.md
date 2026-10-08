@@ -6,7 +6,13 @@
 
 > This document supersedes the earlier insert-MVCC review. It describes the
 > current working tree, including page version 4, append-only row versions,
-> UPDATE/DELETE, version-chain traversal, and transaction-scoped row locks.
+> UPDATE/DELETE, version-chain traversal and transaction-scoped row locks.
+>
+> **Page format 5 (the chunked regions of §17 and §18) has been reverted out.**
+> Chunks made a row's address immutable, which is what lazy materialization
+> would need, but they cost density and complexity and the payoff was never
+> built. §17 and §18 are kept below as the record of what was tried, what it
+> cost, and what it would have taken to bring it back.
 
 ## 1. Executive assessment
 
@@ -29,6 +35,8 @@ Implemented and tested:
 - repeatable-read historical views across committed UPDATE and DELETE;
 - rollback of top-level transactions and savepoints;
 - a page-extension lock around legacy PG19 `ReadBuffer(..., P_NEW)`;
+- contiguous per-column regions, moved on insert with `offsets[]` corrected
+  behind them (§3);
 - eager slot materialization while the PAX page content lock is held.
 
 The implementation is still not production-safe. Generic WAL protects every
@@ -67,9 +75,9 @@ all required callbacks are wired; unsupported families raise
 `FEATURE_NOT_SUPPORTED`. An assertion-enabled build is still recommended as an
 independent validation.
 
-## 3. Page format version 4
+## 3. Page format version 6 — the current format
 
-`PAX_PAGE_VERSION` is 3. Both page flags and header flags require:
+`PAX_PAGE_VERSION` is 6. Both page flags and header flags require:
 
 - `PAX_FLAG_HAS_XMIN_XMAX`;
 - `PAX_FLAG_HAS_VERSIONS`.
@@ -78,8 +86,7 @@ Normal page layout:
 
 ```text
 PageHeaderData
-8-byte padding (PaxPageHeaderPtr = page + 24 + 8, keeps the header 8-aligned)
-PaxPageHeader
+PaxPageHeader                      PaxPageHeaderPtr = page + 24
     n_tuples, meta_offset, free_space, flags
     byte offsets for user-column regions
 
@@ -96,8 +103,34 @@ variable payloads allocated downward from pd_upper
 PaxSpecialData at the page end
 ```
 
-Note that `PaxSpecialData` appears only at the page end; the 8 bytes between
-`PageHeaderData` and `PaxPageHeader` are alignment padding, not a second copy.
+`PaxSpecialData` appears only at the page end, where `PageInit()` puts it.
+
+Up to version 5 there were 8 bytes of padding between `PageHeaderData` and
+`PaxPageHeader`, justified here as keeping the header "8-aligned". That
+justification was wrong, and checking it cost less than a build:
+
+- `PaxPageHeader` is all `uint16` — it needs **2** bytes of alignment;
+- `PaxTupleMetaData` has `uint32` members — it needs **4**;
+- `SizeOfPageHeaderData` is **24**, already a multiple of 8, and buffers are
+  `alignas(MAXIMUM_ALIGNOF)` (`c.h`), so `page + 24` was already 8-aligned.
+
+The 8 bytes satisfied no constraint the layout did not already satisfy. They
+existed because the offset was written `SizeOfPageHeaderData +
+SizeOfPaxSpecialData`, by shape analogy with heap, where a fixed-size area does
+sit right after `PageHeaderData` — the `ItemIdData` array, which PAX does not
+have. Nothing ever read that offset: the real special area is at the page end.
+
+Version 6 removes them. The invariant that actually matters is now asserted
+rather than asserted-in-prose, which is the durable part of the change:
+
+```c
+StaticAssertDecl(SizeOfPageHeaderData % MAXIMUM_ALIGNOF == 0,
+                 "pax: PaxPageHeader would be misaligned without padding");
+```
+
+Cost of the removal: 8 bytes per page, 0.098%. Benefit of taking it: one fewer
+false statement in the format specification, and `pd_lower` starts 8 bytes
+lower. The regression golden did not move.
 
 No `ItemIdData` line pointer array exists on a PAX page. A version is
 identified by its index within the page, which is what `t_ctid` stores, so
@@ -658,6 +691,59 @@ pages holding them had **52 bytes free on average, 42 at most** — far below th
 ~90 bytes a new row needs. Those pages still looked full to the FSM, so INSERT
 never even considered them and the relation grew 234 → 368 pages.
 
+#### The FSM, which is the part that actually works
+
+Worth stating separately because it is easy to assume it is missing.
+`pax_relation_vacuum()` finishes with a full pass over the relation re-recording
+`pax_page_free_space()` for every block, and pages removed by truncation get
+`RecordPageWithFreeSpace(rel, b, 0)` first. Between that pass and the
+per-insert `RecordPageWithFreeSpace()`, the map is never stale.
+
+Measured, with a **fresh backend** so the per-backend target-block hint is not
+what steers the insert — only the FSM can:
+
+| table | steps | pages |
+|---|---|---|
+| `f` | 4000 rows → UPDATE 3500 → VACUUM → +3500 rows | 122 → 228 → **231** |
+| `g` | 4000 rows → +3500 rows, no UPDATE, no VACUUM | 122 → **228** |
+
+Both end at the same row count, but `f` needed **+3 pages** to absorb 3500 new
+rows where `g` needed **+106**. Those 3500 rows landed in slots VACUUM had
+freed, on pages the FSM pointed at. Without the vacuum pass the map still
+described those pages as full and INSERT would not have looked at them at all —
+the original failure mode recorded above, 52 bytes free on average and the
+relation growing 234 → 368.
+
+#### The visibility map, and why it is not there
+
+No PAX page is ever declared all-visible: `visibilitymap_set()` and
+`PageSetAllVisible()` have zero call sites. That is a deliberate omission, not an
+oversight, and the reason is a poor risk/benefit ratio.
+
+**What it would buy.** The VM is consumed by index-only scans. Both callbacks
+PAX needs already exist (`index_fetch_begin` and `tuple_fetch_row_version`), so
+index-only scans work today — they just always take the executor's "dirty" path.
+The saving is skipping `pax_meta_satisfies_snapshot()` per fetched version. It
+is *not* an I/O saving: `nodeIndexOnlyscan` calls the table AM either way, and
+PAX cannot return a tuple without reading the page its slots live in. So the
+ceiling is a per-tuple visibility check, on a path PAX is already 2-4x slower
+than heap for other reasons.
+
+**What it would cost.** A wrong all-visible bit does not degrade, it returns
+wrong rows, so every mutation that can change a page's all-visible status has to
+clear it. PAX appends new versions to pages chosen by the FSM, so a page that
+was all-visible can gain an in-progress version at any time. heap gets this for
+free because `PageAddItem()` clears `PD_ALL_VISIBLE` itself; PAX writes its own
+slots, so it would have to clear both the page flag and the map on every append,
+every UPDATE that lands on such a page, and every reuse of a slot. That is a
+silent-wrong-answer failure mode reachable from the insert path — the most
+exercised code in the AM.
+
+Verdict: implementable, roughly a hundred lines plus a new set of
+correctness assertions, for a single skipped comparison. If index-only scans
+ever become a real workload for PAX, that changes; today it does not justify
+touching the insert path.
+
 #### Compacting the payloads
 
 So VACUUM now also compacts the **payloads** of the dead versions. This is safe
@@ -997,15 +1083,18 @@ Two further traps worth recording:
 1. ~~Fix the multi-row UPDATE deadlock of section 14.~~ **Done** — see section 14.
    The remaining follow-up is to decide whether PAX should eventually implement
    bottom-up index deletion rather than declining it.
-1b. **Finish the chunked regions of section 17.** Stage 1 (reading through chunks)
-   is done and verified; stage 2 (writing without `memmove`) is blocked with the
-   diagnosis and the reference format written down. This is the only open item that
-   unlocks the measured -40% CPU, and it does not depend on the compression
-   prototype. Run the cassert build.
+1b. ~~**Finish the chunked regions of section 17.**~~ **Abandoned** — chunks were
+   built (section 18) and then reverted out: they cost page density, forced
+   payload compaction off, and the payoff they were built for was never built.
+   The page format is back to v4 and payload compaction works again.
+   Lazy materialization is therefore blocked again, on the same precondition and
+   at no extra cost than before the detour. If immovability is wanted back, the
+   cheap route is page-sized extents, not 32-row chunks — the granularity was the
+   mistake, not the idea. See section 18.
 2. **Prototype per-column compression** — the only option in section 16 with a
    measured win (0.18x-0.92x, wins 4/4 data families). Start with one table and
    one `text` column, INSERT/SELECT only, no VACUUM and no concurrency, to
-   validate the concept before committing to page format v5. The known
+   validate the concept before committing to a page format change. The known
    difficulties are the drain (compressed regions vs incremental insert),
    detoasting on the read path, and VACUUM rewriting compressed regions.
    Do **not** spend further time on: reducing `PaxTupleMetaData`, removing
@@ -1212,7 +1301,7 @@ robust, and it does not depend on a fragile arithmetic argument.
 
 The real difficulties are known and are not small:
 
-- **Page format v5.** A version break, as v3 -> v4 was.
+- ~~**Page format v5.**~~ Done, §18. It was a version break, as v3 -> v4 was.
 - **Draining.** PAX inserts incrementally, and adding a row to a compressed
   region means decompress, append, recompress — O(n) per insert, O(n^2) per
   page. Either recompress on every insert, or keep an uncompressed tail region
@@ -1247,11 +1336,17 @@ layout, and no amount of tuning at the slot level changes that. Only changing
 what goes in the page — compressing it — or moving columns out of the page
 addresses it.
 
-## 17. Handoff: stable row addresses (chunked regions), part-built and blocked
+## 17. Design of stable row addresses (chunked regions) — historical
 
-**State of the tree: clean, at page format v4, both suites green, nothing committed
-from this work.** Everything below is a report for the next session, not a
-description of working code. `pax_am.c` was restored with `git checkout --`.
+> **Never landed, and now abandoned.** This is the design that became v5 and was
+> reverted; see section 18 for what it cost and why it went. Kept because the
+> reasoning about *why* immovability is wanted is still the best argument for it,
+> and section 18 records the cheaper shape to retry.
+
+> **Historical.** This section is the design that was written before the work.
+> It is kept because §18 records what actually happened, including two layouts
+> that failed. Where this section says "stage 2 is blocked", read §18 instead:
+> stage 2 is done.
 
 ### The goal, and why it is the right goal
 
@@ -1446,19 +1541,228 @@ The reliable instruments, in order: a `--enable-cassert` build, then behaviour, 
 arithmetic computed from measurements. Never arithmetic from assumptions, and always
 confirm that the installed binary actually changed.
 
+A fourth, added by §18: **measuring a format constant against the case at hand
+instead of the worst case it must survive.** `PAX_CHUNK_MAX_ROWS` was picked at 64
+from a sweep over 1 to 12 `int4` columns, where it looked optimal — and it makes
+a 20-column table unable to fill a page at all, because the chunk set needs
+8384 bytes where a page holds 8192. The per-column chunk was a harmless 272
+bytes; it was the sum over twenty columns that had to fit, and nobody summed it.
+Widening the tests from two columns to twenty is what found it.
+
 ### Where this leaves the options
 
 | option | measured gain | cost | state |
 |---|---|---|---|
 | **per-column compression** | **0.18x - 0.92x, wins 4/4** | 3-5 d prototype, +1-2 w | not started |
-| stable row addresses, this work | **-40% CPU**, unblocks section 16 | design done, stage 2 blocked | stage 1 done |
+| stable row addresses | **-40% CPU** expected, unmeasured since §18 | done | **v5, §18** |
 | column segments in separate files | would reduce pages read | 3-4 w; section 14 deadlock risk | not started |
 | reduce metadata 32 B | **0** (0.7 B short) | page format break | rejected, section 16 |
 | remove payload `MAXALIGN` | **0** (nothing to remove) | - | rejected, section 16 |
 | segments inside pages | **0** on block count | - | rejected, section 16 |
 | TOAST | doubtful for this workload | 1 w + format change | rejected, section 16 |
 
-Recommended order for the next session: finish stage 2 with the cassert build, since
-it is the only item that both unlocks the measured -40% and does not depend on the
-3-5 day compression prototype. If stage 2 proves intractable in one session, fall
-back to per-column compression, which has a measured win today.
+Stage 2 was finished; see §18 for what v5 is and what it cost. Recommended order
+for the next session: **stage 3**, re-measure lazy materialization now that row
+addresses are stable, and keep the content lock released across `getnextslot`
+as it is today. Only after that measurement, drop the `ExecMaterializeSlot()`
+call. Per-column compression remains the fallback with a measured win today.
+
+## 18. Page format version 5: chunks, tried and reverted
+
+**REVERTED, 2026-10-07.** `PAX_PAGE_VERSION` was put back to 4 and `pax_am.c` no
+longer contains a single chunk symbol. This section is kept as the record of what
+was built, what it cost, why it went, and what would have to be true to bring
+immovability back for less. It describes a format that is **not** the one in the
+tree.
+
+### What v5 was
+
+`PaxPageHeader.offsets[]` was replaced by a **chain of chunks** per column:
+
+```c
+typedef struct PaxChunkHdr        /* lived in the arena, never moved */
+{
+    OffsetNumber next_chunk;     /* next chunk of the same column, 0 = end */
+    uint16       n_rows;         /* versions used in this chunk */
+} PaxChunkHdr;                    /* 8 bytes MAXALIGNed */
+
+#define PAX_CHUNK_MAX_ROWS  32
+```
+
+A chunk held, for one column, the NULL bitmap plus `PAX_CHUNK_MAX_ROWS` slots,
+its size depending only on the column stride and never on how many versions it
+held. That is what made it allocatable **once, at full size**: a chunk was
+written once and nothing ever moved it, so a row's address was as stable as a
+heap tuple's `lp_off`. The header kept head and tail per column, so adding a
+chunk was O(1) without walking the chain.
+
+`tupno` mapped to `(chunk = tupno / PAX_CHUNK_MAX_ROWS, rank = tupno %
+PAX_CHUNK_MAX_ROWS)`. `pax_insert_bytes()` was deleted.
+
+### Why it was tried
+
+One reason: heap can lazily extract attributes because a heap tuple never
+moves, and v4 could not offer the same guarantee because a column region is
+memmov'd on every insert. §16 measured the prize at -40% CPU on a
+narrow-projection query. Chunks were the only arrangement found that delivered
+immutability without a compaction pass.
+
+### Why it went
+
+The premise turned out to be weaker than the cost, on two counts.
+
+**The density cliff.** A chunk set is allocated for *all* columns the moment the
+first row opens it, so one page holds `PAX_CHUNK_MAX_ROWS` rows and not one
+more - the next row would need a fresh chunk for every column at once. Measured
+at 20 columns: **32.0 rows per page against heap's 41.8**. Rows per page was
+pinned to the chunk size, not to the data, and lowering the constant did not
+recover density, it only moved the cliff closer.
+
+**Payload compaction had to be disabled.** Chunks and payloads shared the single
+descending frontier above `pd_lower` so that neither could walk into the other.
+Two earlier arrangements failed, both with the same plausible symptom: two
+separate frontiers let compaction walk through the chunks, and growing payloads
+upward from `pd_lower` collided with the metadata region. The resolution was to
+interleave them on one descent, and the consequence was that **payload
+compaction became unsafe**. `pax_vacuum_compact_payload()` was disabled and
+`chunk_floor` kept only as the bound a future compaction would need. Dead
+payload bytes stopped being reclaimed.
+
+The headers were never the problem - a chunk costs exactly 16 bytes per column
+per 32 rows, about 4% of a page. The two structural costs above are what the
+format actually bought.
+
+### What the revert gained, measured
+
+The 20-column regression suite runs unchanged and two page counts improve:
+
+| measurement | with chunks (v5) | reverted (v4) |
+|---|---|---|
+| `tpax_reuse` pages, 10 500 rows | 469 | **260** (-45%) |
+| `tpax_truncate` pages, 2 000 rows | 63 | **48** (-24%) |
+| 12 col `int4`, page ratio vs heap | 1.211 | **1.105** |
+| 12 col `text`, page ratio vs heap | 2.250 | **2.125** |
+| 20 col mixed, page ratio vs heap | 1.340 | **1.170** |
+
+The 45% on `tpax_reuse` is mostly restored payload compaction, not raw density:
+that table churns 4 500 UPDATEs, so with compaction off it carried 4 500 dead
+payloads forever. `mismatched` stays 0 on every column check, so nothing was
+traded away in correctness.
+
+PAX still runs above heap on all three - 1.10 to 2.13 - and that gap is not the
+chunking. It is the columnar layout itself: 32 bytes of metadata per version,
+varlena payloads moved out of line and MAXALIGNed one at a time.
+
+### What was kept from the revert
+
+Two bugs that only chunks exposed, both fixed before reverting so they would
+still bite on v4:
+
+- **The space hint is now an over-estimate, not a lower bound.** In v4 it was
+  deliberately a lower bound ("bitmap delta at zero"). That is a liveness bug in
+  the page-selection loop: a page holding between `hint` and `needed` bytes gets
+  proposed, rejected under the exclusive lock, returned, and re-proposed
+  forever. The hint now counts the worst bitmap growth per column, which closes
+  that interval.
+- **The hint is saturated at `PaxMaxFSMRequestSize` (8160 B).** The FSM rejects
+  anything larger with `invalid FSM request size`, and at 20 columns a wide row
+  exceeds it. Saturating is still an over-estimate, so termination is preserved
+  and the honest `row is too large for one page` diagnostic survives.
+
+### What immovability would take, if it is wanted back
+
+The version is reverted, so this is a decision for later, but the cheap route is
+now clear and it is **not** the one v5 took. The mistake was the granularity: a
+chunk of 32 rows pays its 16 bytes over 32 rows, while heap's equivalent - the
+multi-block line pointer - pays its overhead over one to eight **8 kB pages**.
+Scaling the same idea to page-sized extents would put header cost near 0.2%,
+leave rows-per-page governed by the data again, and still deliver immovable
+addresses. That is the shape to try, and the reason the idea was not wrong so
+much as badly parameterised.
+
+### Still open
+
+- **Lazy materialization remains off** and is now further away, not closer: it
+  needs immovable addresses, and v4 does not provide them. The -40% of section 16
+  is blocked on the same precondition, at no extra cost today than before the
+  detour. Re-measured on a 20-column table it would be worth about -60% — a
+  1-column projection is 25.4 ms against 10.0 ms for the same table at 2
+  columns, since `count(*)`, 1 column and 20 columns all cost the same today —
+  but that is a ceiling, not a promise, and it is unreachable without
+  immovability.
+
+## 19. Storage parameters: `fillfactor` and `toast_tuple_target`
+
+Every table in `sql/pax_am.sql` and `specs/pax_mvcc.spec` is created
+`WITH (fillfactor = 80, toast_tuple_target = 512)`. Three separate facts, easy
+to conflate.
+
+**1. PostgreSQL accepts and records them.** Both are `RELOPT_KIND_HEAP` options
+in `default_reloptions()`, so they validate and store for any `RELKIND_RELATION`
+whatever its AM, bounds included: `fillfactor` in [10, 100], `toast_tuple_target`
+in [128, 8160].
+
+**2. PAX injects no defaults, and cannot.** A table created without the clause
+records nothing, not even heap's 100 / 2040. That is a platform limit:
+
+- `TableAmRoutine` in PG19 has no options callback. Index AMs have `amoptions`;
+  table AMs have nothing to match it with.
+- `DefineRelation()` validates and passes `reloptions` into
+  `heap_create_with_catalog()`, which writes the `pg_class` row. The AM is
+  entered from `heap_create()` → `table_relation_set_new_filelocator()`, i.e.
+  *before* that write, and `reloptions` is not passed to it. By the time PAX
+  runs, `pg_class` is committed to a value PAX did not choose.
+
+So the clause must be written on every `CREATE TABLE`. **It is not inherited**:
+neither `LIKE` nor `CREATE TABLE AS` copies reloptions, not even
+`LIKE ... INCLUDING ALL`, not `INCLUDING STORAGE`. Since nearly every table in
+the suite is built with `LIKE tpax ...`, trusting inheritance would have left the
+rest of the suite with nothing. The regression test asserts this directly, and a
+catalog sweep near its end fails if any PAX table lacks them.
+
+**3. PAX records them and does not obey them.** `rel->rd_options` is never read.
+
+`toast_tuple_target` cannot be honoured without TOAST, which PAX has none of:
+`pax_relation_needs_toast_table()` answers `false`, so a value of any size is
+stored inline in the arena and read back intact. There is no out-of-line storage
+for the option to redirect to.
+
+`fillfactor` could be honoured — a v4 region grows on demand, so there is a
+packing decision to cap — and it is left unimplemented deliberately. Under the
+chunked format of §18 the option had a measured cliff, because a page was
+already more than half consumed by its chunk set before the first row landed:
+at 20 columns the chunk set was 4352 B, ~55% of the usable area, so an 80% cap
+changed nothing (26 and 63 pages either way) while 30% collapsed the table to
+one row per page (61 and 2000 pages).
+
+That cliff belonged to the chunk set and is gone with it. **The effect on v4 is
+not measured** — a first attempt to cap page consumption there reproduced none
+of it, which means the accounting differs enough that the v5 figures do not
+transfer, and redoing it properly is not worth doing for an option that is not
+implemented. What would remain is the ordinary trade: reserved free space buys
+later versions a chance to land on the same page, and costs the space it holds.
+So the tests state the current behaviour — `fillfactor` recorded, not obeyed —
+rather than letting the clause imply the option is live.
+
+## 20. Test tables
+
+Every table has the same shape: 20 columns — primary key, several integer
+widths, floats, text — with one column per slot stride the format distinguishes
+(1, 2, 4, 8, 16). That list is what matters, not the type names: PAX copies
+`Datum` bytes and has no per-type code. The columns that vanished from the
+original two-column suite (`time`, `oid`, bare `numeric`) each sat on a stride
+already covered twice.
+
+The extra assertions came from the width itself, which is what found the two
+bugs in section 18. At 20 columns a check on one column could no longer
+distinguish "the row is right" from "the right columns were gathered":
+
+- the VACUUM check verifies a float, a `bigint`, a `text` and **two independent
+  NULL bits** alongside the rewritten one;
+- the space-reclamation check verifies numeric, text and NULL columns, not just
+  the reused one, so a slot reused with a predecessor's payload fails;
+- the isolation spec aggregates a concatenation of the non-key columns next to
+  the keys, so every MVCC step asserts on all 20. A scan returning the right keys
+  with a neighbour's values is invisible to a key-only check.
+
+Both suites stay green on the cassert and the plain build.
