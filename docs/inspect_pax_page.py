@@ -8,23 +8,21 @@ Deux sorties possibles :
   --schema le schema abstrait du format (zones + ce que fait un INSERT),
            ancre sur la meme page reelle.
 
-Les structures decodees correspondent exactement a pax_am.c (format v4) :
+Les structures decodees correspondent exactement a pax_am.c (format v6) :
 
   PageHeaderData (24 o)          storage/bufpage.h
     pd_lsn 8, pd_checksum 2, pd_flags 2, pd_lower 2,
     pd_upper 2, pd_special 2, pd_pagesize_version 2, pd_prune_xid 4
 
-  8 o de padding d'alignement
-    PaxPageHeaderPtr = page + SizeOfPageHeaderData + SizeOfPaxSpecialData
-
-  PaxPageHeader
+  PaxPageHeader                     PaxPageHeaderPtr = page + 24
     n_tuples 2, meta_offset 2, free_space 2, flags 2, offsets[n_attrs] 2
 
   PaxTupleMetaData : 32 o par version
     xmin 4, xmax 4, cmin 4, cmax 4, t_ctid 6, flags 2, locker_mxid 4, pad 4
 
   region par colonne : [bitmap de NULL][slots]
-    v4 : slot = attlen si longueur fixe, 2 o si varlena, sans MAXALIGN
+    slot = attlen si longueur fixe, 2 o si varlena, sans MAXALIGN
+    (inchangé depuis la version 4 du format de page)
 
   PaxSpecialData (8 o) en fin de page
     version 2, flags 2, n_attrs 2, magic 2
@@ -42,7 +40,13 @@ import sys
 
 BLCKSZ = 8192
 SIZEOF_PAGE_HEADER = 24
-SIZEOF_PAX_SPECIAL = 8
+SIZEOF_PAX_SPECIAL = 8          # la VRAIE zone speciale, en FIN de page.
+                                # Ne plus la confondre avec un bourrage :
+                                # jusqu'en version 5 du format de page,
+                                # PaxPageHeaderPtr vaudait page + 24 + 8. Ce
+                                # bourrage est supprimé (version 6) : il ne
+                                # satisfiait aucun alignement, 24 étant déjà
+                                # multiple de 8.
 SIZEOF_TUPLE_META = 32
 PAX_HEADER_FIXED = 8
 
@@ -88,7 +92,7 @@ def parse_page(page):
      p["pd_special"], p["pd_pagesize_version"], p["pd_prune_xid"]) = \
         struct.unpack_from("<QHHHHHHI", page, 0)
 
-    base = SIZEOF_PAGE_HEADER + SIZEOF_PAX_SPECIAL
+    base = SIZEOF_PAGE_HEADER
     p["pax_header_off"] = base
     p["n_tuples"], p["meta_offset"], p["free_space"], p["pax_flags"] = \
         struct.unpack_from("<HHHH", page, base)
@@ -230,7 +234,6 @@ def page_segments(p):
         cur += size
 
     add("PageHeaderData", SIZEOF_PAGE_HEADER)
-    add("padding", SIZEOF_PAX_SPECIAL)
     add("PaxPageHeader", p["pax_header_size"])
     add("meta", p["meta_end"] - p["meta_offset"])
     for r in p["regions"]:
@@ -314,7 +317,7 @@ def esc(s):
 
 def emit_schema(p, cols, relation, block):
     """
-    Schema abstrait du format v4 : le squelette de la page et ce qu'un INSERT
+    Schema abstrait du format v6 : le squelette de la page et ce qu'un INSERT
     y deplace.
 
     Ce que les deux dumps ne peuvent pas montrer. Un dump est un etat fige ; ce
@@ -348,7 +351,7 @@ def emit_schema(p, cols, relation, block):
     H = H0   # recalcule a la fin sur le contenu reellement trace
     O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
-    O.append('<title>Schéma du format de page PAX v4 — ce que fait un INSERT</title>')
+    O.append('<title>Schéma du format de page PAX v6 — ce que fait un INSERT</title>')
     O.append('<style>'
              '.t{font-size:20px;font-weight:600;fill:#1b2733}'
              '.s{font-size:12px;fill:#5b6b7c}'
@@ -370,7 +373,7 @@ def emit_schema(p, cols, relation, block):
         O.append(f'<text class="{cls}" x="{x}" y="{y}"{a}>{s}</text>')
 
     y = 40
-    txt(24, y, 'Schéma du format de page PAX v4 — une région par colonne', 't')
+    txt(24, y, 'Schéma du format de page PAX v6 — une région par colonne', 't')
     y += 20
     txt(24, y, 'Zones tracées à leur taille réelle ; arithmétique de l\'INSERT '
                'prise dans pax_tuple_insert().', 's')
@@ -383,8 +386,8 @@ def emit_schema(p, cols, relation, block):
     txt(PX, y, 'la page, du haut vers le bas', 'b')
     y += 8
 
-    fills = {"PageHeaderData": "#dbe4ee", "padding": "#eef2f6",
-             "PaxPageHeader": "#c9dcea", "meta": "#e4ecdc",
+    fills = {"PageHeaderData": "#dbe4ee", "PaxPageHeader": "#c9dcea",
+             "meta": "#e4ecdc",
              "libre": "#fdf6e3", "varlena": "#f3e6de",
              "PaxSpecialData": "#dbe4ee"}
 
@@ -676,7 +679,7 @@ def main():
     W, H = 1000, 1180
     O.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="\'DejaVu Sans\',Helvetica,Arial,sans-serif">')
-    O.append(f'<title>Page PAX v4 réelle — {esc(args.relation)} bloc {args.block}</title>')
+    O.append(f'<title>Page PAX v6 réelle — {esc(args.relation)} bloc {args.block}</title>')
     O.append('<style>'
              '.t{font-size:19px;font-weight:600;fill:#1b2733}'
              '.s{font-size:12px;fill:#5b6b7c}'
@@ -691,7 +694,7 @@ def main():
              '</style>')
 
     O.append(f'<rect width="{W}" height="{H}" fill="#fff"/>')
-    O.append(f'<text class="t" x="24" y="36">Page PAX v4 réelle — bloc {args.block} de '
+    O.append(f'<text class="t" x="24" y="36">Page PAX v6 réelle — bloc {args.block} de '
              f'{esc(args.relation)}</text>')
     O.append(f'<text class="s" x="24" y="58">Dump binaire via pageinspect.get_raw_page(), '
              f'décodé selon les structures de pax_am.c — toutes les tailles ci-dessous sont '
@@ -721,13 +724,6 @@ def main():
     txt(IN, y + 48, f"pd_lower <tspan font-weight='600'>{p['pd_lower']}</tspan> · "
                     f"pd_upper <tspan font-weight='600'>{p['pd_upper']}</tspan> · "
                     f"pd_special {p['pd_special']}", "z m")
-    y += h
-
-    # --- padding ------------------------------------------------------------
-    h = 20
-    box(h, "#eef2f6", "4 2")
-    txt(IN, y + 14, "padding d'alignement — PaxPageHeaderPtr = page + 24 + 8", "z")
-    txt(PX + PW - 14, y + 14, f"8 o — offset {SIZEOF_PAGE_HEADER}", "zr", "end")
     y += h
 
     # --- PaxPageHeader ------------------------------------------------------

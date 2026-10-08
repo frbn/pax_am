@@ -1,113 +1,111 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1446" viewBox="0 0 1200 1560" font-family="'DejaVu Sans',Helvetica,Arial,sans-serif">
-<title>Schéma du format de page PAX v4 — ce que fait un INSERT</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1431" viewBox="0 0 1200 1560" font-family="'DejaVu Sans',Helvetica,Arial,sans-serif">
+<title>Schéma du format de page PAX v6 — ce que fait un INSERT</title>
 <style>.t{font-size:20px;font-weight:600;fill:#1b2733}.s{font-size:12px;fill:#5b6b7c}.h{font-size:14px;font-weight:600;fill:#1b2733}.b{font-size:11.5px;font-weight:600;fill:#1b2733}.l{font-size:11.5px;fill:#1b2733}.m{font-family:'DejaVu Sans Mono',Menlo,monospace}.z{font-size:10px;fill:#45566a}.zr{font-size:10px;fill:#45566a;text-anchor:end}.f{stroke:#33475b;stroke-width:2}</style>
 <rect width="1200" height="1560" fill="#fff"/>
-<text class="t" x="24" y="40">Schéma du format de page PAX v4 — une région par colonne</text>
+<text class="t" x="24" y="40">Schéma du format de page PAX v6 — une région par colonne</text>
 <text class="s" x="24" y="60">Zones tracées à leur taille réelle ; arithmétique de l'INSERT prise dans pax_tuple_insert().</text>
 <text class="s" x="24" y="76">Ancré sur le bloc 0 de demo : 99 versions, 6 colonnes.</text>
 <text class="b" x="40" y="102">la page, du haut vers le bas</text>
 <rect class="f" x="40" y="110" width="500" height="15.0" fill="#dbe4ee"/>
 <text class="z" x="52" y="120.0">PageHeaderData · 24 o</text>
-<rect class="f" x="40" y="125.0" width="500" height="15.0" fill="#eef2f6"/>
-<text class="z" x="52" y="135.0">padding · 8 o</text>
-<rect class="f" x="40" y="140.0" width="500" height="15.0" fill="#c9dcea"/>
-<text class="z" x="52" y="150.0">PaxPageHeader · 24 o</text>
-<rect class="f" x="40" y="155.0" width="500" height="74.0" fill="#e4ecdc"/>
-<text class="b" x="52" y="170.0">meta</text>
-<text class="zr" x="530" y="170.0" text-anchor="end">3168 o</text>
-<text class="zr" x="530" y="183.0" text-anchor="end">[56, 3224)</text>
-<rect class="f" x="40" y="229.0" width="500" height="23.6376953125" fill="#dfe9f2"/>
-<text class="z" x="52" y="247.6376953125">col0 · 412 o</text>
-<rect class="f" x="40" y="252.6376953125" width="500" height="15.0" fill="#dfe9f2"/>
-<text class="z" x="52" y="262.6376953125">col1 · 214 o</text>
-<rect class="f" x="40" y="267.6376953125" width="500" height="23.6376953125" fill="#dfe9f2"/>
-<text class="z" x="52" y="286.275390625">col2 · 412 o</text>
-<rect class="f" x="40" y="291.275390625" width="500" height="46.357421875" fill="#dfe9f2"/>
-<text class="b" x="52" y="306.275390625">col3</text>
-<text class="zr" x="530" y="306.275390625" text-anchor="end">808 o</text>
-<text class="zr" x="530" y="319.275390625" text-anchor="end">[4262, 5070)</text>
+<rect class="f" x="40" y="125.0" width="500" height="15.0" fill="#c9dcea"/>
+<text class="z" x="52" y="135.0">PaxPageHeader · 24 o</text>
+<rect class="f" x="40" y="140.0" width="500" height="74.0" fill="#e4ecdc"/>
+<text class="b" x="52" y="155.0">meta</text>
+<text class="zr" x="530" y="155.0" text-anchor="end">3168 o</text>
+<text class="zr" x="530" y="168.0" text-anchor="end">[48, 3216)</text>
+<rect class="f" x="40" y="214.0" width="500" height="23.6376953125" fill="#dfe9f2"/>
+<text class="z" x="52" y="232.6376953125">col0 · 412 o</text>
+<rect class="f" x="40" y="237.6376953125" width="500" height="15.0" fill="#dfe9f2"/>
+<text class="z" x="52" y="247.6376953125">col1 · 214 o</text>
+<rect class="f" x="40" y="252.6376953125" width="500" height="23.6376953125" fill="#dfe9f2"/>
+<text class="z" x="52" y="271.275390625">col2 · 412 o</text>
+<rect class="f" x="40" y="276.275390625" width="500" height="46.357421875" fill="#dfe9f2"/>
+<text class="b" x="52" y="291.275390625">col3</text>
+<text class="zr" x="530" y="291.275390625" text-anchor="end">808 o</text>
+<text class="zr" x="530" y="304.275390625" text-anchor="end">[4254, 5062)</text>
+<rect class="f" x="40" y="322.6328125" width="500" height="15.0" fill="#dfe9f2"/>
+<text class="z" x="52" y="332.6328125">col4 · 214 o</text>
 <rect class="f" x="40" y="337.6328125" width="500" height="15.0" fill="#dfe9f2"/>
-<text class="z" x="52" y="347.6328125">col4 · 214 o</text>
-<rect class="f" x="40" y="352.6328125" width="500" height="15.0" fill="#dfe9f2"/>
-<text class="z" x="52" y="362.6328125">col5 · 115 o</text>
-<rect class="f" x="40" y="367.6328125" width="500" height="15.0" fill="#fdf6e3" stroke-dasharray="4 2"/>
-<text class="z" x="52" y="377.6328125">libre · 1 o</text>
-<rect class="f" x="40" y="382.6328125" width="500" height="74.0" fill="#f3e6de"/>
-<text class="b" x="52" y="397.6328125">varlena</text>
-<text class="zr" x="530" y="397.6328125" text-anchor="end">2784 o</text>
-<text class="zr" x="530" y="410.6328125" text-anchor="end">[5400, 8184)</text>
-<rect class="f" x="40" y="456.6328125" width="500" height="15.0" fill="#dbe4ee"/>
-<text class="z" x="52" y="466.6328125">PaxSpecialData · 8 o</text>
-<text class="l" x="40" y="487.6328125">offset 0 en haut, 8192 en bas.</text>
-<text class="l" x="40" y="502.6328125">pd_lower monte quand une région ou la métadonnée grandit ;</text>
-<text class="l" x="40" y="517.6328125">pd_upper descend quand une valeur hors ligne est allouée.</text>
-<text class="l" x="40" y="532.6328125">L'espace libre est ce qui reste entre les deux.</text>
-<text class="h" x="40" y="556.6328125">Ce que contient chaque zone</text>
-<text class="b" x="40" y="576.6328125">· PaxPageHeader</text>
-<text class="zr" x="530" y="576.6328125" text-anchor="end">24 o</text>
-<text class="m" x="54" y="591.6328125">n_tuples, meta_offset, free_space, flags,</text>
-<text class="m" x="54" y="604.6328125">puis offsets[6] — un offset par colonne</text>
-<text class="b" x="40" y="624.6328125">· zone de métadonnées</text>
-<text class="zr" x="530" y="624.6328125" text-anchor="end">3168 o</text>
-<text class="m" x="54" y="639.6328125">99 × 32 o = 3168 o</text>
-<text class="z" x="184" y="639.6328125">une PaxTupleMetaData par version</text>
-<text class="b" x="40" y="659.6328125">· région 0 — id</text>
-<text class="zr" x="530" y="659.6328125" text-anchor="end">412 o</text>
-<text class="m" x="54" y="674.6328125">bitmap 16 o  +  99 slots × 4 o  = 412 o</text>
-<text class="b" x="40" y="694.6328125">· région 1 — label</text>
-<text class="zr" x="530" y="694.6328125" text-anchor="end">214 o</text>
-<text class="m" x="54" y="709.6328125">bitmap 16 o  +  99 slots × 2 o  = 214 o</text>
-<text class="b" x="40" y="729.6328125">· région 2 — small</text>
-<text class="zr" x="530" y="729.6328125" text-anchor="end">412 o</text>
-<text class="m" x="54" y="744.6328125">bitmap 16 o  +  99 slots × 4 o  = 412 o</text>
-<text class="b" x="40" y="764.6328125">· région 3 — ratio</text>
-<text class="zr" x="530" y="764.6328125" text-anchor="end">808 o</text>
-<text class="m" x="54" y="779.6328125">bitmap 16 o  +  99 slots × 8 o  = 808 o</text>
-<text class="b" x="40" y="799.6328125">· région 4 — note</text>
-<text class="zr" x="530" y="799.6328125" text-anchor="end">214 o</text>
-<text class="m" x="54" y="814.6328125">bitmap 16 o  +  99 slots × 2 o  = 214 o</text>
-<text class="b" x="40" y="834.6328125">· région 5 — flag</text>
-<text class="zr" x="530" y="834.6328125" text-anchor="end">115 o</text>
-<text class="m" x="54" y="849.6328125">bitmap 16 o  +  99 slots × 1 o  = 115 o</text>
-<text class="b" x="40" y="869.6328125">· valeurs hors ligne</text>
-<text class="zr" x="530" y="869.6328125" text-anchor="end">2784 o</text>
-<text class="m" x="54" y="884.6328125">le slot ne contient que l'offset absolu, 2 o</text>
-<text class="h" x="40" y="918.6328125">Ce que fait UN INSERT</text>
-<text class="m" x="40" y="938.6328125">· id         +4 o</text>
-<text class="z" x="230" y="938.6328125">= bitmap 0 o + slot 4 o</text>
-<text class="m" x="40" y="955.6328125">· label      +2 o</text>
-<text class="z" x="230" y="955.6328125">= bitmap 0 o + slot 2 o</text>
-<text class="m" x="40" y="972.6328125">· small      +4 o</text>
-<text class="z" x="230" y="972.6328125">= bitmap 0 o + slot 4 o</text>
-<text class="m" x="40" y="989.6328125">· ratio      +8 o</text>
-<text class="z" x="230" y="989.6328125">= bitmap 0 o + slot 8 o</text>
-<text class="m" x="40" y="1006.6328125">· note       +2 o</text>
-<text class="z" x="230" y="1006.6328125">= bitmap 0 o + slot 2 o</text>
-<text class="m" x="40" y="1023.6328125">· flag       +1 o</text>
-<text class="z" x="230" y="1023.6328125">= bitmap 0 o + slot 1 o</text>
-<text class="m" x="40" y="1040.6328125">· métadonnées +32 o</text>
-<text class="m" x="40" y="1057.6328125">  pd_lower : 5399 → 5420</text>
-<text class="l" x="40" y="1074.6328125">  valeurs hors ligne : pd_upper descend d'autant</text>
-<text class="h" x="40" y="1100.6328125">Le coût, mesuré sur cette page</text>
-<text class="l" x="40" y="1120.6328125">· 7126 octets memmovés par INSERT — une fois par</text>
-<text class="l" x="54" y="1136.6328125">colonne, chaque pax_insert_bytes() décalant</text>
-<text class="l" x="54" y="1152.6328125">tout ce qui suit la région qu'il agrandit</text>
-<text class="l" x="40" y="1168.6328125">· 6 memmove et 6 passes sur offsets[]</text>
-<text class="l" x="54" y="1184.6328125">par ligne insérée</text>
-<text class="l" x="40" y="1200.6328125">· soit 87 % d'une page déplacée pour écrire</text>
-<text class="l" x="54" y="1216.6328125">une seule ligne</text>
-<text class="l" x="40" y="1232.6328125">· un INSERT coûte donc O(lignes déjà présentes)</text>
-<text class="l" x="54" y="1248.6328125">× colonnes — pas O(1) comme un tuple heap</text>
-<text class="h" x="40" y="1274.6328125">Pourquoi déplacer ne casse rien</text>
-<text class="l" x="40" y="1294.6328125">Un t_ctid PAX ne contient pas un offset d'octet : il contient</text>
-<text class="l" x="40" y="1309.6328125">(bloc, index de version). Décaler une région ne déplace donc aucun</text>
-<text class="l" x="40" y="1324.6328125">lien entrant — un lien vers la version 7 pointe toujours vers</text>
-<text class="l" x="40" y="1339.6328125">l'index 7, où qu'elle soit devenue. Le seul ascenseur à corriger</text>
-<text class="l" x="40" y="1354.6328125">est offsets[], et la boucle le reconstruit.</text>
-<text class="l" x="40" y="1373.6328125">C'est la contrepartie exacte de heap : là, lp_off est un offset</text>
-<text class="l" x="40" y="1388.6328125">réel et un tuple ne bouge jamais ; PAX bouge mais n'a que des</text>
-<text class="l" x="40" y="1403.6328125">liens logiques. Laquelle des deux échange vaut mieux est la</text>
-<text class="l" x="40" y="1418.6328125">question ouverte de analyse1.md §18.</text>
+<text class="z" x="52" y="347.6328125">col5 · 115 o</text>
+<rect class="f" x="40" y="352.6328125" width="500" height="15.0" fill="#fdf6e3" stroke-dasharray="4 2"/>
+<text class="z" x="52" y="362.6328125">libre · 9 o</text>
+<rect class="f" x="40" y="367.6328125" width="500" height="74.0" fill="#f3e6de"/>
+<text class="b" x="52" y="382.6328125">varlena</text>
+<text class="zr" x="530" y="382.6328125" text-anchor="end">2784 o</text>
+<text class="zr" x="530" y="395.6328125" text-anchor="end">[5400, 8184)</text>
+<rect class="f" x="40" y="441.6328125" width="500" height="15.0" fill="#dbe4ee"/>
+<text class="z" x="52" y="451.6328125">PaxSpecialData · 8 o</text>
+<text class="l" x="40" y="472.6328125">offset 0 en haut, 8192 en bas.</text>
+<text class="l" x="40" y="487.6328125">pd_lower monte quand une région ou la métadonnée grandit ;</text>
+<text class="l" x="40" y="502.6328125">pd_upper descend quand une valeur hors ligne est allouée.</text>
+<text class="l" x="40" y="517.6328125">L'espace libre est ce qui reste entre les deux.</text>
+<text class="h" x="40" y="541.6328125">Ce que contient chaque zone</text>
+<text class="b" x="40" y="561.6328125">· PaxPageHeader</text>
+<text class="zr" x="530" y="561.6328125" text-anchor="end">24 o</text>
+<text class="m" x="54" y="576.6328125">n_tuples, meta_offset, free_space, flags,</text>
+<text class="m" x="54" y="589.6328125">puis offsets[6] — un offset par colonne</text>
+<text class="b" x="40" y="609.6328125">· zone de métadonnées</text>
+<text class="zr" x="530" y="609.6328125" text-anchor="end">3168 o</text>
+<text class="m" x="54" y="624.6328125">99 × 32 o = 3168 o</text>
+<text class="z" x="184" y="624.6328125">une PaxTupleMetaData par version</text>
+<text class="b" x="40" y="644.6328125">· région 0 — id</text>
+<text class="zr" x="530" y="644.6328125" text-anchor="end">412 o</text>
+<text class="m" x="54" y="659.6328125">bitmap 16 o  +  99 slots × 4 o  = 412 o</text>
+<text class="b" x="40" y="679.6328125">· région 1 — label</text>
+<text class="zr" x="530" y="679.6328125" text-anchor="end">214 o</text>
+<text class="m" x="54" y="694.6328125">bitmap 16 o  +  99 slots × 2 o  = 214 o</text>
+<text class="b" x="40" y="714.6328125">· région 2 — small</text>
+<text class="zr" x="530" y="714.6328125" text-anchor="end">412 o</text>
+<text class="m" x="54" y="729.6328125">bitmap 16 o  +  99 slots × 4 o  = 412 o</text>
+<text class="b" x="40" y="749.6328125">· région 3 — ratio</text>
+<text class="zr" x="530" y="749.6328125" text-anchor="end">808 o</text>
+<text class="m" x="54" y="764.6328125">bitmap 16 o  +  99 slots × 8 o  = 808 o</text>
+<text class="b" x="40" y="784.6328125">· région 4 — note</text>
+<text class="zr" x="530" y="784.6328125" text-anchor="end">214 o</text>
+<text class="m" x="54" y="799.6328125">bitmap 16 o  +  99 slots × 2 o  = 214 o</text>
+<text class="b" x="40" y="819.6328125">· région 5 — flag</text>
+<text class="zr" x="530" y="819.6328125" text-anchor="end">115 o</text>
+<text class="m" x="54" y="834.6328125">bitmap 16 o  +  99 slots × 1 o  = 115 o</text>
+<text class="b" x="40" y="854.6328125">· valeurs hors ligne</text>
+<text class="zr" x="530" y="854.6328125" text-anchor="end">2784 o</text>
+<text class="m" x="54" y="869.6328125">le slot ne contient que l'offset absolu, 2 o</text>
+<text class="h" x="40" y="903.6328125">Ce que fait UN INSERT</text>
+<text class="m" x="40" y="923.6328125">· id         +4 o</text>
+<text class="z" x="230" y="923.6328125">= bitmap 0 o + slot 4 o</text>
+<text class="m" x="40" y="940.6328125">· label      +2 o</text>
+<text class="z" x="230" y="940.6328125">= bitmap 0 o + slot 2 o</text>
+<text class="m" x="40" y="957.6328125">· small      +4 o</text>
+<text class="z" x="230" y="957.6328125">= bitmap 0 o + slot 4 o</text>
+<text class="m" x="40" y="974.6328125">· ratio      +8 o</text>
+<text class="z" x="230" y="974.6328125">= bitmap 0 o + slot 8 o</text>
+<text class="m" x="40" y="991.6328125">· note       +2 o</text>
+<text class="z" x="230" y="991.6328125">= bitmap 0 o + slot 2 o</text>
+<text class="m" x="40" y="1008.6328125">· flag       +1 o</text>
+<text class="z" x="230" y="1008.6328125">= bitmap 0 o + slot 1 o</text>
+<text class="m" x="40" y="1025.6328125">· métadonnées +32 o</text>
+<text class="m" x="40" y="1042.6328125">  pd_lower : 5391 → 5412</text>
+<text class="l" x="40" y="1059.6328125">  valeurs hors ligne : pd_upper descend d'autant</text>
+<text class="h" x="40" y="1085.6328125">Le coût, mesuré sur cette page</text>
+<text class="l" x="40" y="1105.6328125">· 7126 octets memmovés par INSERT — une fois par</text>
+<text class="l" x="54" y="1121.6328125">colonne, chaque pax_insert_bytes() décalant</text>
+<text class="l" x="54" y="1137.6328125">tout ce qui suit la région qu'il agrandit</text>
+<text class="l" x="40" y="1153.6328125">· 6 memmove et 6 passes sur offsets[]</text>
+<text class="l" x="54" y="1169.6328125">par ligne insérée</text>
+<text class="l" x="40" y="1185.6328125">· soit 87 % d'une page déplacée pour écrire</text>
+<text class="l" x="54" y="1201.6328125">une seule ligne</text>
+<text class="l" x="40" y="1217.6328125">· un INSERT coûte donc O(lignes déjà présentes)</text>
+<text class="l" x="54" y="1233.6328125">× colonnes — pas O(1) comme un tuple heap</text>
+<text class="h" x="40" y="1259.6328125">Pourquoi déplacer ne casse rien</text>
+<text class="l" x="40" y="1279.6328125">Un t_ctid PAX ne contient pas un offset d'octet : il contient</text>
+<text class="l" x="40" y="1294.6328125">(bloc, index de version). Décaler une région ne déplace donc aucun</text>
+<text class="l" x="40" y="1309.6328125">lien entrant — un lien vers la version 7 pointe toujours vers</text>
+<text class="l" x="40" y="1324.6328125">l'index 7, où qu'elle soit devenue. Le seul ascenseur à corriger</text>
+<text class="l" x="40" y="1339.6328125">est offsets[], et la boucle le reconstruit.</text>
+<text class="l" x="40" y="1358.6328125">C'est la contrepartie exacte de heap : là, lp_off est un offset</text>
+<text class="l" x="40" y="1373.6328125">réel et un tuple ne bouge jamais ; PAX bouge mais n'a que des</text>
+<text class="l" x="40" y="1388.6328125">liens logiques. Laquelle des deux échange vaut mieux est la</text>
+<text class="l" x="40" y="1403.6328125">question ouverte de analyse1.md §18.</text>
 <rect x="588" y="104" width="572" height="143" fill="#f7f9fb" stroke="#c3cedb"/>
 <text class="h" x="602" y="125">Pas de slot, par type</text>
 <text class="m" x="602" y="146">1 o    bool, "char"                     ch</text>

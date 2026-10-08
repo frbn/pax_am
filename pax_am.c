@@ -80,8 +80,16 @@ PG_MODULE_MAGIC;
  * 4 = slots packés sans suralignement (pas = attlen, ou 2 pour un varlena).
  *     Une page v3 serait relue avec un pas faux : les versions 3 et 4 sont
  *     incompatibles, pas seulement différentes.
+ * 5 = (retiré) chunks de taille fixe par colonne. Abandonné, cf. analyse1.md.
+ * 6 = suppression des 8 octets de bourrage entre PageHeaderData et
+ *     PaxPageHeader. pd_lower baisse de 8 sur toutes les pages.
+ *
+ * On saute volontairement le numéro 5 : il a porté le format à chunks. Lui
+ * réutiliser serait un piège — une page à chunks porte version 5, et la relire
+ * comme le format courant produirait des slots faux sans lever la moindre
+ * erreur. Les numéros se consomment, ils ne se réattribuent pas.
  */
-#define PAX_PAGE_VERSION            4
+#define PAX_PAGE_VERSION            6
 #define PAX_SPECIAL_MAGIC           0x5041 /* "PA" */
 
 #define PAX_FLAG_HAS_NULLS          0x0001
@@ -169,9 +177,35 @@ typedef struct PaxPageHeader
 
 #define SizeOfPaxPageHeaderFixed    offsetof(PaxPageHeader, offsets)
 
-/* là où commence l'en-tête PAX dans une page (càd après l'en-tête et les données spéciales). */
+/*
+ * Où commence l'en-tête PAX dans une page : juste après PageHeaderData.
+ *
+ * Il y avait ici 8 octets de bourrage, justifiés par un « header 8-aligned »
+ * qui ne tenait pas : PaxPageHeader ne contient que des uint16 (alignement 2),
+ * PaxTupleMetaData seulement des uint32 (alignement 4), et SizeOfPageHeaderData
+ * vaut 24, déjà multiple de 8 — le tampon de base l'est aussi. Les 8 octets ne
+ * satisfaisaient donc aucune contrainte que la disposition ne satisfasse déjà.
+ * Ils étaient là parce que l'offset s'écrivait + SizeOfPaxSpecialData, par
+ * analogie de forme avec heap. La zone spéciale réelle est à la fin de la
+ * page, écrite par PageInit() ; rien n'a jamais été lu à cet endroit.
+ *
+ * L'invariant réel, celui qui compte, est que l'en-tête tombe sur une frontière
+ * MAXIMUM_ALIGNO. Il est posé plus bas en StaticAssert, pas ici : un chiffre
+ * dans un commentaire n'est pas une garantie.
+ */
 #define PaxPageHeaderPtr(page)  \
-    ((PaxPageHeader *) ((char *) (page) + SizeOfPageHeaderData + SizeOfPaxSpecialData))
+    ((PaxPageHeader *) ((char *) (page) + SizeOfPageHeaderData))
+
+/*
+ * Le tampon vient de ReadBuffer et vient d'un AlignedBuffer, déclaré
+ * `alignas(MAXIMUM_ALIGNOF) char data[BLCKSZ]` (c.h). Il suffit donc que
+ * SizeOfPageHeaderData soit multiple de MAXIMUM_ALIGNOF pour que
+ * PaxPageHeader, puis pd_lower et la région de métadonnées, heredent de cet
+ * alignement. C'est le seul vrai invariant ici, et il vaut pour 24 = 3 x 8
+ * sans qu'aucun octet de bourrage soit nécessaire.
+ */
+StaticAssertDecl(SizeOfPageHeaderData % MAXIMUM_ALIGNOF == 0,
+                 "pax: PaxPageHeader would be misaligned without padding");
 
 /*
  * Nos « offsets » sont des positions EN OCTETS dans la page (0..BLCKSZ-1),
@@ -2308,17 +2342,17 @@ pax_page_init(Page page, int n_attrs)
     header_size = SizeOfPaxPageHeaderFixed + n_attrs * sizeof(OffsetNumber);
     header_size = MAXALIGN(header_size);
 
-    phdr = (PaxPageHeader *) ((char *) page + SizeOfPageHeaderData + SizeOfPaxSpecialData);
+    phdr = PaxPageHeaderPtr(page);
 
     phdr->n_tuples   = 0;
-    phdr->free_space = (uint16) (BLCKSZ - (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size));
+    phdr->free_space = (uint16) (BLCKSZ - (SizeOfPageHeaderData + header_size));
     phdr->flags      = PAX_FLAG_HAS_XMIN_XMAX | PAX_FLAG_HAS_VERSIONS;
 
     for (i = 0; i < n_attrs; i++)
         phdr->offsets[i] = InvalidOffsetNumber;
 
     ((PageHeader) page)->pd_lower =
-        (LocationIndex) (SizeOfPageHeaderData + SizeOfPaxSpecialData + header_size);
+        (LocationIndex) (SizeOfPageHeaderData + header_size);
     phdr->meta_offset = (OffsetNumber) ((PageHeader) page)->pd_lower;
 }
 
