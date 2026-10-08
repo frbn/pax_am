@@ -15,8 +15,13 @@
  *     page, régions de colonnes qui grandissent, bitmap de NULL par colonne
  *
  * Limitations :
- *   - FSM utilisé pour le choix de page à l'insertion, mais jamais mis à jour
- *     par un VACUUM (inexistant) : l'espace libre ne fait que décroître
+ *   - carte de visibilité (VM) jamais écrite : aucune page PAX n'est déclarée
+ *     all-visible. Les scans index-only fonctionnent (les deux callbacks sont
+ *     là), mais prennent toujours le chemin "dirty" et ne peuvent pas sauter le
+ *     test de visibilité. Voir analyse1.md pour pourquoi le gain est faible et
+ *     le piège de correction élevé.
+ *   - le FSM, lui, est bien mis à jour : à chaque insertion, et une fois de
+ *     plus par VACUUM (pax_relation_vacuum)
  *   - versions UPDATE / DELETE append-only, sans VACUUM ni gel des tuples
  *   - Generic WAL couvre les mutations de page ; l'insertion spéculative reste
  *     non supportée
