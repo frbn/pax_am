@@ -13,10 +13,10 @@ Three table-AM callbacks can produce an inserted row. Only the first two do work
 
 | callback | implementation | notes |
 |---|---|---|
-| `tuple_insert` | `pax_tuple_insert` (4028) | the real path: one row per call |
-| `multi_insert` | `pax_multi_insert` (991) | a `for` loop over `tuple_insert`, nothing more |
-| `tuple_insert_speculative` | `pax_tuple_insert_speculative` (976) | rejects |
-| `tuple_complete_speculative` | `pax_tuple_complete_speculative` (984) | rejects |
+| `tuple_insert` | `pax_tuple_insert` (4073) | the real path: one row per call |
+| `multi_insert` | `pax_multi_insert` (1036) | a `for` loop over `tuple_insert`, nothing more |
+| `tuple_insert_speculative` | `pax_tuple_insert_speculative` (1021) | rejects |
+| `tuple_complete_speculative` | `pax_tuple_complete_speculative` (1029) | rejects |
 
 ```c
 static void
@@ -45,7 +45,7 @@ table_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 ```
 
 **Signature note.** `options` is `uint32_t` for `PG_VERSION_NUM >= 190000` and
-`int` before that; `pax_am.c:4026` carries the `#if`. Only
+`int` before that; `pax_am.c:4071` carries the `#if`. Only
 `TABLE_INSERT_FROZEN` is examined.
 
 ### The two rejections at the top of the function
@@ -167,9 +167,12 @@ Two deliberate properties:
 **It is an over-estimate, not a lower bound.** `pax_insert_space_needed` counts
 the *actual* bitmap growth of this row, which is `pax_bitmap_size(tupno+1) -
 pax_bitmap_size(tupno)`. Because `pax_bitmap_size` MAXALIGNs to 8, that delta is
-either **0 or 8** bytes per column — 8 only on the versions that cross an
-8-version boundary (tupno 0, 8, 16, …). The hint charges `sizeof(uint64)` = 8
-per column, which is therefore not a loose bound but *exactly* the worst case.
+either **0 or 8** bytes per column — 8 only when the MAXALIGNed bitmap grows,
+which happens when `tupno` crosses a multiple of 64 (tupno 0, 64, 128, …).
+`pax_bitmap_size(n)` is `MAXALIGN(ceil(n/8))`, so it stays at 8 bytes for
+1..64 rows, 16 bytes for 65..128, and so on. The hint charges
+`sizeof(uint64)` = 8 per column on every row: that is the exact worst case for
+one row, but a loose bound for the 63 rows out of 64 where the actual delta is 0.
 
 If the hint were a lower bound instead, a page holding between `hint` and
 `needed` free bytes would be proposed by the FSM, rejected under the exclusive
@@ -699,7 +702,7 @@ Measured on the 20-column regression schema:
 | quantity | value |
 |---|---|
 | bytes memmoved per INSERT | 7126 on the 99-version 6-column `demo` page (87% of a page) |
-| `memmove` calls per INSERT | 1 for the metadata record, +1 per column, +1 more per column whose NULL bitmap crosses an 8-version boundary |
+| `memmove` calls per INSERT | 1 for the metadata record, +1 per column, +1 more per column whose NULL bitmap crosses a 64-version boundary (1 row in 64) |
 | `offsets[]` repair passes | one per `pax_insert_bytes`, i.e. one per call above |
 | metadata | 32 B per version |
 | largest single value on an empty page | 7784 B measured, for the regression row shape at 20 columns |

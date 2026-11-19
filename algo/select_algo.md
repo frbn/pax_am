@@ -15,14 +15,14 @@ serves three of them.
 
 | table-AM callback | implementation | used for |
 |---|---|---|
-| `scan_begin` | `pax_scan_begin` (3664) | open a scan |
-| `scan_rescan` | `pax_scan_rescan` (3727) | restart it |
-| `scan_getnextslot` | `pax_scan_getnextslot` (3843) | sequential scan |
-| `scan_getnextslot_tidrange` | `pax_scan_getnextslot_tidrange` (3965) | `WHERE ctid = …` / `ctid BETWEEN` |
-| `scan_end` | `pax_scan_end` (3711) | close, release the pin |
-| `scan_set_tidrange` | `pax_scan_set_tidrange` (3927) | set the TID bounds |
-| `tuple_satisfies_snapshot` | `pax_tuple_satisfies_snapshot` (5617) | re-check a slot the executor holds |
-| `index_fetch_begin/tuple` | `pax_index_fetch_begin` / `pax_index_fetch_tuple` (719 / 754) | index-only scans |
+| `scan_begin` | `pax_scan_begin` (3670) | open a scan |
+| `scan_rescan` | `pax_scan_rescan` (3733) | restart it |
+| `scan_getnextslot` | `pax_scan_getnextslot` (3849) | sequential scan |
+| `scan_getnextslot_tidrange` | `pax_scan_getnextslot_tidrange` (3971) | `WHERE ctid = …` / `ctid BETWEEN` |
+| `scan_end` | `pax_scan_end` (3717) | close, release the pin |
+| `scan_set_tidrange` | `pax_scan_set_tidrange` (3933) | set the TID bounds |
+| `tuple_satisfies_snapshot` | `pax_tuple_satisfies_snapshot` (5639) | re-check a slot the executor holds |
+| `index_fetch_begin/tuple` | `pax_index_fetch_begin` / `pax_index_fetch_tuple` (725 / 760) | index-only scans |
 
 There is no `scan_gettuple`: PG19 requires `scan_getnextslot`, and a slot is
 what PAX returns. The executor reaches it through `tableam.h`:
@@ -61,7 +61,9 @@ if (pscan != NULL)
 - **No scan keys.** Qualifying conditions are pushed above the AM, never into
   it. `nkeys != 0` is a hard error, not a silent full scan.
 - **No parallel table scan.** One backend per scan: the page layout cache below
-  is per-scan state, and the content lock is held across materialization.
+  is per-scan state, and the content lock is held across materialization. The
+  rejection is an `ERROR`, not a fallback, and the planner does not know that —
+  see the trap in §13.
 - **No backward scan.** Checked per call in `pax_scan_getnextslot`.
 - **`SO_TYPE_ANALYZE` is accepted** and behaves specially — see §6.
 
@@ -548,10 +550,13 @@ version at the given TID, checks it with `pax_meta_satisfies_snapshot()`, and
 materializes under the content lock.
 
 **No visibility map.** PAX never calls `visibilitymap_set()`, so no page is
-ever all-visible, and `nodeIndexOnlyscan` always takes the "dirty" path. Both
-callbacks exist and index-only scans work; they just cannot skip the
-visibility test. `analyse1.md` explains why the payoff would be one comparison
-against a silent-wrong-answer risk in the insert path.
+ever all-visible, and `nodeIndexOnlyscan` always takes the "dirty" path: it
+calls `index_fetch_heap()` for every row, which reads the heap page, checks
+`pax_meta_satisfies_snapshot()`, and materializes all columns. Both callbacks
+exist and index-only scans work; a VM would remove the entire heap fetch, not
+just the visibility test (`Heap Fetches:` equals the row count). The reason it
+is still absent is the correctness surface in the insert path, not a negligible
+gain; `analyse1.md` has the cost/benefit.
 
 Note that PAX's index entries are per-version: an UPDATE writes a new entry for
 the new version, and the old entry still resolves to the old, now-invisible
@@ -680,3 +685,55 @@ keeping by-reference `Datum`s pointing into the page instead of copying them
 out — which needs row addresses that do not move. They do not, in v4, and
 that is the trade §18 of `analyse1.md` documents: the chunked v5 made them
 stable and paid for it in page density.
+
+---
+
+## 13. A trap worth knowing before you load a table
+
+PAX rejects a parallel table scan with an `ERROR` (§1), and the planner has no
+way to know that. On a large enough PAX table it will choose a parallel plan
+anyway, and the query then fails outright:
+
+```text
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM big2;   -- 61157 pages
+
+  Finalize Aggregate
+    ->  Gather
+          Workers Planned: 4
+          ->  Partial Aggregate
+                ->  Parallel Seq Scan on big2
+
+SET max_parallel_workers_per_gather = 4;
+SELECT count(*) FROM big2;
+
+ERROR:  pax table AM does not support parallel table scans
+```
+
+This is not hypothetical: it is the default once a PAX table is large enough for
+the parallel cost alternative to win. A 579-page table does not trigger it; a
+61157-page one does, on a plain `count(*)`. The identical heap table in the same
+database gets `Aggregate -> Seq Scan`. Note that a failing query here is a
+*runtime* error on a plan that looked perfectly normal in `EXPLAIN`.
+
+Either workaround is sufficient:
+
+```sql
+ALTER TABLE t SET (parallel_workers = 0);          -- per table
+SET max_parallel_workers_per_gather = 0;           -- per session
+```
+
+Two related notes:
+
+- Setting `parallel_workers = 0` really does disable partial paths:
+  `compute_parallel_worker()` uses the reloption whenever it is not -1, and
+  `create_plain_partial_paths()` returns without adding a partial path when the
+  result is <= 0. A *positive* value only sets the target worker count; zero is
+  special.
+- **`DELETE` is not affected.** The planner does not put a parallel scan under a
+  `ModifyTable` node, so a large `DELETE` stays serial.
+
+The honest fix is for `scan_begin` to accept a parallel scan rather than reject
+it, or for the planner to be told PAX cannot parallelize. Rejecting at execution
+time turns a planning decision into a runtime failure, which is the worst place
+for it to surface.

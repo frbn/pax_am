@@ -9,23 +9,29 @@
  *   - initialisation de page
  *   - construction du descripteur de page
  *   - extraction de valeurs (pax_get_value)
- *   - slot custom avec materialization lazy
+ *   - slot custom, matérialisé sous le verrou de contenu (les régions de
+ *     colonnes peuvent bouger, donc pas de Datum par référence dans la page)
  *   - scan séquentiel basique
  *   - insertion réelle : première page libre, valeurs variables en haut de
  *     page, régions de colonnes qui grandissent, bitmap de NULL par colonne
  *
  * Limitations :
  *   - carte de visibilité (VM) jamais écrite : aucune page PAX n'est déclarée
- *     all-visible. Les scans index-only fonctionnent (les deux callbacks sont
- *     là), mais prennent toujours le chemin "dirty" et ne peuvent pas sauter le
- *     test de visibilité. Voir analyse1.md pour pourquoi le gain est faible et
- *     le piège de correction élevé.
+ *     all-visible. Les scans index-only fonctionnent (index_fetch_tuple et
+ *     tuple_satisfies_snapshot sont en place), mais chaque ligne retournée
+ *     repasse par le TABLE AM : le plan affiche "Heap Fetches" = nombre de
+ *     lignes. La VM supprimerait ce fetch complet, pas seulement un test de
+ *     visibilité ; voir analyse1.md pour le rapport coût/bénéfice réel (non
+ *     mesuré sur PAX) et le piège de correction.
  *   - le FSM, lui, est bien mis à jour : à chaque insertion, et une fois de
  *     plus par VACUUM (pax_relation_vacuum)
- *   - versions UPDATE / DELETE append-only, sans VACUUM ni gel des tuples
+ *   - UPDATE append-only (chaîne de versions) ; DELETE marque en place
+ *     (xmax + t_ctid = soi-même), sans déplacement. L'espace ne revient
+ *     qu'au VACUUM, qui marque UNUSED et compacte les charges utiles
  *   - Generic WAL couvre les mutations de page ; l'insertion spéculative reste
  *     non supportée
- *   - pas d'index, de parallélisme ou d'opérations DDL non réécrivantes
+ *   - index supportés, mais sans chaîne HOT : chaque version a sa propre
+ *     entrée. Pas de parallélisme, de CLUSTER/VACUUM FULL ni de SET ACCESS METHOD
  *
  */
 
@@ -2233,7 +2239,7 @@ static const TableAmRoutine pax_methods = {
     .parallelscan_initialize = pax_parallelscan_initialize,
     .parallelscan_reinitialize = pax_parallelscan_reinitialize,
 
-    /* Index fetch is unsupported. */
+    /* Index fetch : une entrée d'index pointe une seule version, sans HOT. */
     .index_fetch_begin = pax_index_fetch_begin,
     .index_fetch_reset = pax_index_fetch_reset,
     .index_fetch_end = pax_index_fetch_end,
@@ -4153,10 +4159,26 @@ pax_tuple_insert(Relation rel, TupleTableSlot *slot,
      * candidate : la place réelle est revérifiée sous verrou exclusif avant
      * toute écriture.
      *
-     * Contrairement à heap, le FSM est enregistré après chaque insertion
-     * réussie. Heap délègue ce travail à VACUUM ; PAX n'a pas de VACUUM,
-     * donc rien ne renseignerait jamais la carte et chaque insertion
-     * étendrait la relation.
+     * Contrairement à heap, le FSM est aussi enregistré après chaque
+     * insertion réussie (plus bas, après GenericXLogFinish).
+     *
+     * La justification d'origine — « PAX n'a pas de VACUUM, donc rien ne
+     * renseignerait jamais la carte » — n'est plus vraie : pax_relation_vacuum
+     * ré-enregistre toutes les pages à la fin de sa passe. La mise à jour par
+     * insertion est donc devenue redondante. Mesuré avec un commutateur
+     * temporaire (depuis retiré) : la désactiver ne change ni le débit
+     * (117-119 k lignes/s en un seul backend, 19.0 k tps à 8, dans les deux
+     * cas) ni le nombre de pages (6042 pour 200000 lignes), et toute la suite
+     * de tests passe.
+     *
+     * Elle reste correcte et sans danger, parce que l'espace libre de PAX ne
+     * fait que décroître : l'entrée ne peut que surestimer, donc il faut au
+     * pire une candidate rejetée puis revérifiée sous verrou exclusif, jamais
+     * une écriture dans une page trop petite. On la garde pour que la carte
+     * reste fraîche pour les AUTRES backends — RelationSetTargetBlock ne vaut
+     * que pour le backend qui écrit — et elle deviendrait nécessaire si une
+     * insertion rendait un jour de l'espace (compactage à l'insertion, ou
+     * réutilisation d'un slot qui en libère).
      */
     hint   = pax_insert_space_hint(rel, values, isnulls);
     nblocks = RelationGetNumberOfBlocks(rel);
